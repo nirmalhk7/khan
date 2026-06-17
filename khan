@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+SOURCE=$0
+while [ -L "$SOURCE" ]; do
+  DIR=$(CDPATH= cd -P -- "$(dirname -- "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  case "$SOURCE" in
+    /*) ;;
+    *) SOURCE="$DIR/$SOURCE" ;;
+  esac
+done
+
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$SOURCE")" && pwd)
+exec "$ROOT/.venv/bin/python" "$ROOT/scripts/khan_cli.py" "$@"

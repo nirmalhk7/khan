@@ -1,0 +1,461 @@
+from __future__ import annotations
+
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from datetime import UTC, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from khan_core.agent_adapters import AgentAdapterRegistry, AgentCommand, JsonlAgentAdapter
+from khan_core.agents import AgentSessionRunner
+from khan_core.attention import AttentionRouter
+from khan_core.codex_cli import CodexCLI, CodexCancelled
+from khan_core.loop_engine import LoopEngine
+from khan_core.models import AgentSessionEvent, ProjectConfig, RunProcess, TaskCapsule
+from khan_core.queue_worker import QueueWorker, QueueWorkerError
+from khan_core.store import RunLockedError, Store
+
+
+FAKE_CODEX = r"""#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+args = sys.argv[1:]
+if args[0] == "review":
+    print("VERDICT: PASS")
+    raise SystemExit(0)
+out = pathlib.Path(args[args.index("--output-last-message") + 1])
+workspace = pathlib.Path(args[args.index("-C") + 1])
+if os.environ.get("FAKE_HANG"):
+    print(json.dumps({"type": "started"}), flush=True)
+    while True: time.sleep(.1)
+change = os.environ.get("FAKE_CHANGE")
+if change:
+    path = workspace / change
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("changed\n")
+print(json.dumps({"type": "thread.started", "thread_id": "fake-session", "text": "working"}), flush=True)
+out.write_text(json.dumps({
+    "status": "done", "summary": "done", "changed_files": ["reported-lie.txt"],
+    "tests_run": [], "open_risks": [], "next_action": ""
+}))
+"""
+
+FAKE_CURSOR = r"""#!/usr/bin/env python3
+import json, pathlib, sys
+args = sys.argv[1:]
+if "--version" in args:
+    print("cursor-agent fake")
+    raise SystemExit(0)
+workspace = pathlib.Path(args[args.index("--workspace") + 1])
+prompt = args[-1]
+print(json.dumps({"type": "session.started", "chatId": "cursor-chat", "text": "started"}), flush=True)
+print(json.dumps({"type": "message", "text": f"cursor done: {prompt[:20]}"}), flush=True)
+"""
+
+
+class FoundationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.fake = self.root / "fake-codex"
+        self.fake.write_text(FAKE_CODEX)
+        self.fake.chmod(self.fake.stat().st_mode | stat.S_IEXEC)
+        self.fake_cursor = self.root / "fake-cursor-agent"
+        self.fake_cursor.write_text(FAKE_CURSOR)
+        self.fake_cursor.chmod(self.fake_cursor.stat().st_mode | stat.S_IEXEC)
+        self.say_log = self.root / "say.log"
+        self.fake_say = self.root / "fake-say"
+        self.fake_say.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(self.say_log)!r}).write_text(' '.join(sys.argv[1:]))\n"
+        )
+        self.fake_say.chmod(self.fake_say.stat().st_mode | stat.S_IEXEC)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_migrations_and_run_lock(self) -> None:
+        store = Store(self.root / "state")
+        with store._connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+        task = store.create_task("p", "t", "p", "s", None)
+        run = store.create_run(task.id, "p", str(self.root))
+        with store.run_lock(run.id):
+            with self.assertRaises(RunLockedError):
+                with store.run_lock(run.id):
+                    pass
+        store.start_process(RunProcess(run_id=run.id, pid=123, command=["x"],
+                                       started_at=datetime.now(UTC), heartbeat_at=datetime.now(UTC)))
+        self.assertEqual(store.get_run(run.id).process_id, 123)
+        store.finish_process(run.id, 123, 0)
+        self.assertIsNone(store.get_run(run.id).process_id)
+
+    def test_legacy_database_migrates(self) -> None:
+        state = self.root / "legacy"
+        state.mkdir()
+        with sqlite3.connect(state / "orch.db") as conn:
+            conn.executescript("""
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, project TEXT, title TEXT, prompt TEXT,
+                  success_criteria TEXT, profile TEXT, created_at TEXT);
+                CREATE TABLE runs (id TEXT PRIMARY KEY, task_id TEXT, project TEXT, status TEXT,
+                  iteration INTEGER, workspace TEXT, summary TEXT, created_at TEXT, updated_at TEXT);
+                CREATE TABLE events (id INTEGER PRIMARY KEY, run_id TEXT, ts TEXT, phase TEXT,
+                  message TEXT, payload TEXT);
+            """)
+        store = Store(state)
+        with store._connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+        self.assertIn("process_id", columns)
+
+    def test_task_capsules_are_persisted(self) -> None:
+        store = Store(self.root / "state")
+        capsule = TaskCapsule(
+            objective="objective",
+            acceptance_criteria=["done"],
+            allowed_paths=["docs"],
+            verification=["make test"],
+            conflict_domains=["docs"],
+        )
+        task = store.create_task("p", "title", "prompt", "success", None, capsule)
+        loaded = store.get_task_capsule(task.id)
+        self.assertEqual(loaded.allowed_paths, ["docs"])
+        self.assertEqual(loaded.conflict_domains, ["docs"])
+
+        store.set_task_capsule(task.id, capsule.model_copy(update={"blast_radius": "medium"}))
+        self.assertEqual(store.get_task_capsule(task.id).blast_radius, "medium")
+
+    def test_agent_session_store_lifecycle(self) -> None:
+        store = Store(self.root / "state")
+        session = store.create_agent_session("codex", "p", str(self.root), "prompt")
+        store.start_agent_session(session.id, 456)
+        store.update_agent_session_external_id(session.id, "external-1")
+        store.append_agent_session_event(
+            AgentSessionEvent(
+                session_id=session.id,
+                ts=datetime.now(UTC),
+                stream="stdout",
+                message="started",
+                payload={"type": "session.started"},
+            )
+        )
+        store.finish_agent_session(session.id, "succeeded", "done")
+        loaded = store.get_agent_session(session.id)
+        self.assertEqual(loaded.status, "succeeded")
+        self.assertEqual(loaded.external_id, "external-1")
+        self.assertIsNone(loaded.process_id)
+        self.assertEqual(store.list_agent_sessions()[0].id, session.id)
+        events = store.list_agent_session_events(session.id)
+        self.assertEqual(events[0].message, "started")
+
+    def test_streaming_and_cancellation(self) -> None:
+        project = ProjectConfig(name="p", path=self.root, workspace_mode="in_place")
+        schema = self.root / "schema.json"
+        schema.write_text("{}")
+        output = self.root / "result.json"
+        events = []
+        result, returned = CodexCLI(str(self.fake)).exec_task(
+            self.root, "prompt", schema, output, project, extra_env={"FAKE_CHANGE": "x.txt"},
+            on_event=events.append,
+        )
+        self.assertEqual(result.summary, "done")
+        self.assertEqual(events, returned)
+
+        started = time.monotonic()
+        with self.assertRaises(CodexCancelled):
+            CodexCLI(str(self.fake)).exec_task(
+                self.root, "prompt", schema, output, project, extra_env={"FAKE_HANG": "1"},
+                commands=lambda: [(1, "cancel")] if time.monotonic() - started > .2 else [],
+            )
+
+    def test_engine_uses_git_diff_for_protected_paths(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: true
+  say_bin: {self.fake_say}
+  phrase: Nirmal, Khan needs your input.
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  p:
+    name: p
+    path: {repo}
+    workspace_mode: in_place
+    protected_paths: [protected]
+    env:
+      FAKE_CHANGE: protected/secret.txt
+""")
+        engine = LoopEngine(config)
+        task = engine.store.create_task("p", "title", "prompt", "success", None)
+        run_id = engine.run_task(task.id)
+        run = engine.store.get_run(run_id)
+        self.assertEqual(run.status, "needs_human")
+        self.assertEqual(run.session_id, "fake-session")
+        self.assertIn("Protected path", run.summary)
+        self.assertIn("Protected path changed", self.say_log.read_text())
+        events = engine.store.list_events(run_id, limit=20)
+        self.assertTrue(any(event.phase == "notify" and event.payload["sent"] for event in events))
+
+    def test_engine_enforces_capsule_allowed_paths(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  p:
+    name: p
+    path: {repo}
+    workspace_mode: in_place
+    env:
+      FAKE_CHANGE: src/outside.txt
+""")
+        engine = LoopEngine(config)
+        capsule = TaskCapsule(objective="prompt", acceptance_criteria=["success"], allowed_paths=["docs"])
+        task = engine.store.create_task("p", "title", "prompt", "success", None, capsule)
+        run_id = engine.run_task(task.id)
+        run = engine.store.get_run(run_id)
+        self.assertEqual(run.status, "needs_human")
+        self.assertIn("outside", run.summary)
+        events = engine.store.list_events(run_id, limit=20)
+        needs_human = [event for event in events if event.phase == "needs_human"][-1]
+        self.assertEqual(needs_human.payload["outside_allowed_paths"], ["src/outside.txt"])
+
+    def test_conflict_domain_blocks_active_runs(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 5
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  p:
+    name: p
+    path: {self.root}
+    workspace_mode: in_place
+""")
+        engine = LoopEngine(config)
+        capsule = TaskCapsule(objective="prompt", acceptance_criteria=["success"], conflict_domains=["docs"])
+        first = engine.store.create_task("p", "first", "prompt", "success", None, capsule)
+        second = engine.store.create_task("p", "second", "prompt", "success", None, capsule)
+        active = engine.store.create_run(first.id, "p", str(self.root))
+        engine.store.update_run(active.id, "running", "active")
+        with self.assertRaisesRegex(RuntimeError, "conflicts with active run"):
+            engine.run_task(second.id)
+
+    def test_attention_router_and_metrics(self) -> None:
+        store = Store(self.root / "state")
+        task = store.create_task("p", "title", "prompt", "success", None)
+        run = store.create_run(task.id, "p", str(self.root))
+        store.update_run(run.id, "needs_human", "review required")
+        session = store.create_agent_session("cursor-agent", "p", str(self.root), "prompt")
+        store.start_agent_session(session.id, 1234)
+        item = store.enqueue_task(task.id)
+
+        router = AttentionRouter(store)
+        cards = router.cards()
+        self.assertEqual(cards[0].classification, "decision_required")
+        self.assertEqual(cards[0].subject_type, "run")
+        metrics = router.metrics()
+        self.assertEqual(metrics["runs"]["needs_human"], 1)
+        self.assertEqual(metrics["sessions"]["active"], 1)
+        self.assertEqual(metrics["queue"]["queued"], 1)
+        self.assertTrue(any(card.subject_type == "queue" and card.run_id == item.id for card in cards))
+
+    def test_queue_claim_requeue_and_cancel_lifecycle(self) -> None:
+        store = Store(self.root / "state")
+        task = store.create_task("p", "title", "prompt", "success", None)
+        first = store.enqueue_task(task.id, priority=20)
+        second = store.enqueue_session("cursor-agent", "p", "prompt", priority=10)
+        claimed = store.claim_next_queue_item("worker-1")
+        self.assertEqual(claimed.id, second.id)
+        self.assertEqual(claimed.status, "running")
+        self.assertEqual(claimed.attempts, 1)
+        self.assertEqual(claimed.lease_owner, "worker-1")
+
+        store.complete_queue_item(claimed.id, "session-result")
+        completed = store.get_queue_item(claimed.id)
+        self.assertEqual(completed.status, "succeeded")
+        self.assertEqual(completed.result_id, "session-result")
+
+        store.cancel_queue_item(first.id)
+        self.assertEqual(store.get_queue_item(first.id).status, "cancelled")
+
+    def test_queue_worker_processes_session_items(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  p:
+    name: p
+    path: {self.root}
+    workspace_mode: in_place
+""")
+        store = Store(state)
+        item = store.enqueue_session("cursor-agent", "p", "queued prompt")
+        worker = QueueWorker(config, worker_id="test-worker")
+        processed = worker.process_once()
+        self.assertEqual(processed.id, item.id)
+        self.assertEqual(processed.status, "succeeded")
+        self.assertTrue(processed.result_id)
+        session = store.get_agent_session(processed.result_id)
+        self.assertEqual(session.status, "succeeded")
+        self.assertEqual(session.external_id, "cursor-chat")
+
+    def test_queue_worker_records_failures(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects: {{}}
+""")
+        store = Store(state)
+        item = store.enqueue_item("session", {"provider": "cursor-agent", "project": "missing", "prompt": ""})
+        worker = QueueWorker(config, worker_id="test-worker")
+        with self.assertRaises(QueueWorkerError):
+            worker.process_once()
+        failed = store.get_queue_item(item.id)
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("missing provider", failed.error)
+
+    def test_codex_and_cursor_agent_sessions_are_recorded(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  p:
+    name: p
+    path: {self.root}
+    workspace_mode: in_place
+""")
+        runner = AgentSessionRunner(config)
+        codex_session_id = runner.start_session("codex", "p", "codex prompt")
+        cursor_session_id = runner.start_session("cursor-agent", "p", "cursor prompt")
+
+        codex_session = runner.store.get_agent_session(codex_session_id)
+        cursor_session = runner.store.get_agent_session(cursor_session_id)
+        self.assertEqual(codex_session.status, "succeeded")
+        self.assertEqual(codex_session.external_id, "fake-session")
+        self.assertIn('"summary": "done"', codex_session.summary)
+        self.assertEqual(cursor_session.status, "succeeded")
+        self.assertEqual(cursor_session.external_id, "cursor-chat")
+        self.assertIn("cursor done", cursor_session.summary)
+        cursor_events = runner.store.list_agent_session_events(cursor_session_id)
+        self.assertTrue(any(event.message == "started" for event in cursor_events))
+
+    def test_custom_agent_adapter_can_be_registered(self) -> None:
+        class FakeAgentAdapter(JsonlAgentAdapter):
+            name = "fake-agent"
+
+            def build_command(self, **kwargs) -> AgentCommand:
+                return AgentCommand(
+                    argv=[
+                        sys.executable,
+                        "-c",
+                        "import json; print(json.dumps({'session_id': 'custom-session', 'text': 'custom done'}))",
+                    ]
+                )
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  p:
+    name: p
+    path: {self.root}
+    workspace_mode: in_place
+""")
+        registry = AgentAdapterRegistry()
+        registry.register(FakeAgentAdapter())
+        runner = AgentSessionRunner(config, registry=registry)
+        session_id = runner.start_session("fake-agent", "p", "custom prompt")
+        session = runner.store.get_agent_session(session_id)
+        self.assertEqual(session.provider, "fake-agent")
+        self.assertEqual(session.external_id, "custom-session")
+        self.assertEqual(session.summary, "custom done")
+
+
+if __name__ == "__main__":
+    unittest.main()
