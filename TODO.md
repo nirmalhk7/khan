@@ -1,105 +1,183 @@
-# Khan Handoff
+# Khan TODO
 
-This file tracks remaining platform work. It is kept because not every backlog
-item is implemented yet.
+Khan is a local-first orchestration layer for Codex and Cursor Agent. It should
+optimize for a developer actively supervising local coding work: fast task setup,
+parallel provider comparison, strong evidence capture, safe adoption of changes,
+and recoverable agent sessions.
 
 ## Implemented
 
-- Versioned SQLite migrations, including legacy-schema migration.
+- Versioned SQLite migrations and durable local state.
 - Durable tasks, task capsules, task runs, agent sessions, events, artifacts,
   process IDs, heartbeats, commands, failure fingerprints, and external session
   IDs.
 - Codex task loop with structured output, JSONL capture, validation, optional
   review, runtime timeout, idle timeout, pause/resume/cancel polling, retry
-  limits, repeated-failure detection, empty-diff stop, and protected-path stop.
+  limits, repeated-failure detection, empty-diff stop, allowed-path enforcement,
+  and protected-path stop.
 - Task capsules with acceptance criteria, expected files, allowed paths,
-  protected paths, verification recipes, blast radius, dependencies, and
-  conflict domains.
+  protected paths, verification recipes, blast radius, dependencies, and conflict
+  domains.
 - Conflict-domain scheduling guard for active task runs.
-- Capsule allowed-path enforcement after worker changes.
 - Durable queue items for task runs and agent sessions.
-- Foreground queue worker and daemon loop with success/failure recording.
+- Foreground queue worker, detached daemon supervisor, daemon heartbeat/status,
+  stale lease recovery, and success/failure recording.
 - Worktree-by-default isolation and failed-worktree cleanup.
 - Provider-neutral agent sessions with built-in `codex` and `cursor-agent`
   adapters.
-- Adapter registry for future agent providers.
+- Adapter registry for future providers.
 - macOS `say` notification when task runs enter `needs_human`.
 - Attention router and JSON metrics command.
-- CLI help text for projects, tasks, runs, sessions, attention, metrics, and
-  TUI.
-- README and `/docs` covering setup, CLI, config, adapters, and operations.
+- CLI docs, README, configuration docs, adapter docs, and operations docs.
 - Test coverage with fake Codex, Cursor Agent, and `say` binaries.
 
-## Remaining
+## Khan-Unique Roadmap
 
-### Detached Daemon Supervision
+### 1. Zero-Friction Local Tasks
 
-- Queue dispatch exists through `khan queue work` and `khan daemon`, but both are
-  foreground loops.
-- Need detached process supervision, crash recovery, restart behavior, and stale
-  lease reclamation policy.
+- Add `khan ask . "prompt"` for current-repo one-off work without requiring
+  `khan project add`.
+- Auto-create an ephemeral project config from the current git root.
+- Infer validation commands from the repo and persist the inferred recipe in the
+  run artifacts.
+- Add `khan last`, `khan ps`, `khan diff <id>`, `khan summary <id>`, and
+  unambiguous partial ID resolution.
 
-### Same-Session Steering
+### 2. Provider Duel Mode
 
-- Provider-neutral sessions persist external IDs but do not yet resume or steer
-  the same provider session.
-- `RunCommand` supports `steer` conceptually, but no steering path injects new
-  instructions into Codex or Cursor Agent sessions.
-- `retry_run` still starts a fresh task run from the stored task and capsule.
+- Add `khan duel . "prompt"` to run Codex and Cursor Agent against the same task
+  capsule in isolated sibling worktrees.
+- Store one parent duel record and one child run/session per provider.
+- Capture for each provider:
+  - prompt
+  - transcript
+  - changed files
+  - diff stat
+  - validation result
+  - runtime
+  - summary
+  - open risks
+- Produce `duel-report.md` comparing both outputs.
+- Add `khan duel show <id>` and `khan duel artifacts <id>`.
 
-### Multi-Agent Topology
+### 3. Cross-Review Mode
 
-- The durable task loop still has one Codex worker and one optional Codex
-  reviewer.
-- No supervisor, builder, tester, reviewer, summarizer, or parallel worker
-  topology exists yet.
-- No fan-out/fan-in protocol or per-role prompt templates exist yet.
+- Add `khan cross-review <duel-id>`.
+- Have Codex review Cursor Agent's diff.
+- Have Cursor Agent review Codex's diff using the same review prompt.
+- Store both critiques as artifacts.
+- Add a final Khan decision card with:
+  - strongest implementation
+  - validation winner
+  - reviewer disagreements
+  - files requiring human inspection
+  - recommended adopt/reject action
 
-### Production TUI
+### 4. Relay Mode
 
-- The TUI is still a scaffold.
-- Missing: row selection, detail panes, live log tailing, artifact drill-down,
-  status coloring/filtering, and keybound run/session actions.
+- Add `khan relay . "prompt" --first codex --second cursor-agent`.
+- First provider plans or implements.
+- Second provider continues from the first provider's workspace or critique.
+- Support preset relays:
+  - `codex-plan cursor-build`
+  - `cursor-build codex-review`
+  - `codex-fix cursor-polish`
+- Persist every handoff prompt as an artifact so relays are inspectable.
 
-### Atomic Commit Enforcement
+### 5. Patch Adoption Workflow
 
-- Khan records changed files and artifacts but does not yet enforce commits on
-  success.
-- Need optional commit creation, commit-message policy, and clean-worktree
-  enforcement before marking runs complete.
+- Add `khan adopt <run-id>` to copy a selected run's worktree changes into the
+  main checkout.
+- Add `khan reject <run-id>` to discard the worktree and mark the result rejected.
+- Add `khan adopt <duel-id> --provider codex|cursor-agent`.
+- Before adoption:
+  - show changed files
+  - show validation status
+  - warn on protected paths
+  - refuse adoption if the destination worktree is dirty unless `--force`
+- Record adoption decisions in SQLite.
 
-### Review Loop
+### 6. Replay And Benchmarking
 
-- Reviewer verdict parsing is intentionally minimal.
-- No accepted/rejected finding filter.
-- No targeted validation rerun selection from review findings.
-- No parallel validation plus review closeout.
+- Add `khan replay <run-id> --provider codex|cursor-agent`.
+- Reuse the original task capsule, prompt, validation recipe, and project state.
+- Add `khan bench prompts.yaml` for repeatable provider evaluation.
+- Score each run using:
+  - validation pass/fail
+  - number of iterations
+  - review verdict
+  - protected/allowed path compliance
+  - human adoption decision
+  - runtime
+- Export benchmark results as JSON and Markdown.
 
-### Project Discovery
+### 7. Same-Session Steering
 
-- Discovery is still heuristic.
-- Missing richer support for `justfile`, `tox.ini`, `uv`, monorepo script
-  resolution, and more language-specific validation inference.
+- Add `khan steer <session-id> "message"` for provider sessions where resume or
+  continued input is supported.
+- Add adapter methods:
+  - `resume_command`
+  - `send_message`
+  - `supports_steering`
+- Codex steering should use captured external session IDs when possible.
+- Cursor Agent steering should use its external chat/session ID when possible.
+- If a provider cannot steer, Khan should create a continuation session with the
+  prior transcript and mark it as a fork.
 
-### Packaging And CI
+### 8. Evidence Ledger
 
-- No Python package metadata yet.
-- No shell completion wiring.
-- No CI workflow yet.
-- No license file yet.
+- Add a run-level `evidence.md` artifact summarizing:
+  - objective
+  - capsule constraints
+  - provider
+  - commands run
+  - files changed
+  - validation output
+  - review output
+  - risks
+  - final recommendation
+- Add `khan explain <id>` to render this evidence in the terminal.
+- Add JSON output for scripts: `khan explain <id> --json`.
 
-## Recommended Next Steps
+### 9. TUI As Local Cockpit
 
-1. Add detached daemon supervision and stale lease recovery.
-2. Add same-session steering for adapters that support resume/continue.
-3. Upgrade the TUI into a real operator console.
-4. Add optional atomic commit enforcement on successful runs.
-5. Add packaging metadata, license, and CI.
+- Upgrade the Textual TUI around local decision-making, not fleet PR monitoring.
+- Add panes for:
+  - active runs
+  - duels
+  - provider sessions
+  - evidence
+  - diff summary
+  - validation output
+- Add keybindings:
+  - `d` diff
+  - `e` evidence
+  - `a` adopt
+  - `x` reject
+  - `r` replay
+  - `s` steer
+  - `c` cancel
+- Show Codex and Cursor Agent outputs side-by-side for duel records.
 
-## Useful Files
+### 10. Detached Supervision Polish
 
-- `README.md`
-- `docs/`
-- `scripts/khan_cli.py`
-- `scripts/khan/`
-- `scripts/`
+- Add automatic crash restart policy for failed daemon records.
+- Add `khan daemon logs`.
+- Add launchd/systemd templates for users who want OS-level supervision.
+- Add stale daemon heartbeat detection thresholds in config.
+
+## Test Plan
+
+- CLI tests for `ask`, partial IDs, `duel`, `cross-review`, `relay`, `adopt`,
+  `reject`, `replay`, `bench`, and `explain`.
+- Store migration tests for duel records, adoption decisions, replay metadata,
+  and evidence artifacts.
+- Fake Codex and fake Cursor Agent tests for provider duel and cross-review.
+- Worktree tests for safe adoption, dirty-destination refusal, and rejection
+  cleanup.
+- Adapter tests for steering support and continuation fallback.
+- TUI smoke tests for duel view, evidence view, and action keybindings.
+
+## Provider Constraint
+
+Codex and Cursor Agent are the supported providers for now.

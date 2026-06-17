@@ -81,11 +81,19 @@ khan queue work --once
 khan queue work
 khan queue cancel <queue-item-id>
 khan queue requeue <queue-item-id>
-khan daemon
+khan daemon start
+khan daemon status
+khan daemon stop
+khan daemon run
 ```
 
-`queue work` and `daemon` run foreground worker loops. Khan does not yet install
-or supervise a detached background service.
+`queue work` runs a foreground worker loop. `daemon start` records and launches
+a detached daemon process. `daemon status` shows PID, heartbeat, status, last
+processed queue item, and errors. Khan reclaims stale running queue leases before
+workers claim new work.
+
+Use the same `--config <path>` with `daemon start`, `daemon status`, and
+`daemon stop` when operating a non-default Khan state store.
 
 ## Cancellation
 
@@ -139,6 +147,8 @@ Coverage currently includes:
 - attention routing and metrics
 - durable queue lifecycle
 - queue worker success and failure handling
+- detached daemon start/status/stop
+- stale queue lease recovery
 - agent session persistence
 - built-in Codex and Cursor Agent sessions
 - custom adapter registration
@@ -146,7 +156,7 @@ Coverage currently includes:
 
 ## Known Operational Gaps
 
-- No detached daemon supervisor yet; `khan daemon` is a foreground loop.
+- No automatic crash restart policy or daemon log tailing yet.
 - No web UI.
 - TUI cannot yet perform actions from selected rows.
 - Provider-neutral sessions cannot yet resume or steer an existing external

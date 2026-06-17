@@ -72,11 +72,11 @@ orchestration work:
 - Event streams and artifacts as first-class operational evidence.
 - Human attention routing instead of silent failure.
 - Provider adapters instead of hard-coded agent assumptions.
-- Durable queue items plus a foreground worker loop.
+- Durable queue items plus foreground and detached daemon worker loops.
 
 ## Not Yet Complete
 
-- No detached daemon supervisor yet.
+- No automatic daemon crash restart policy yet.
 - No same-session steering or resume path for the provider-neutral session API.
 - No supervisor/builder/tester/reviewer topology yet.
 - The TUI does not yet support selecting records, tailing logs, or triggering

@@ -15,9 +15,9 @@ terminal session at a time.
 
 ## Status
 
-Khan is early FOSS infrastructure. It is usable as a local CLI today, but
-detached daemon supervision, richer TUI, same-session steering, and multi-agent
-topologies are still being built.
+Khan is early FOSS infrastructure. It is usable as a local CLI today, but richer
+TUI, same-session steering, crash restart policy, and multi-agent topologies are
+still being built.
 
 Currently implemented:
 
@@ -26,8 +26,9 @@ Currently implemented:
 - Persisted task capsules with acceptance criteria, allowed paths, protected
   paths, verification recipes, blast radius, dependencies, and conflict domains.
 - Conflict-domain scheduling guardrails for active runs.
-- Durable queue items for task runs and agent sessions, plus a foreground worker
-  and daemon loop.
+- Durable queue items for task runs and agent sessions, foreground workers,
+  detached daemon start/status/stop, stale lease recovery, and last-item
+  tracking.
 - Provider-neutral session registry for headless agents.
 - Built-in agent adapters for `codex` and `cursor-agent`.
 - Adapter registry for third-party agents.
@@ -88,6 +89,8 @@ khan task capsule <task-id>
 khan task run <task-id>
 khan task enqueue <task-id>
 khan queue work --once
+khan daemon start
+khan daemon status
 khan watch <run-id>
 khan attention
 khan metrics
@@ -185,7 +188,7 @@ Important implementation areas:
 - Codex task loop.
 - Provider-neutral session runner.
 - Agent adapter protocol and built-ins.
-- Durable queue and foreground worker.
+- Durable queue, foreground worker, and detached daemon supervisor.
 - Attention cards and metrics.
 - SQLite migrations and persistence.
 - Textual operator console scaffold.
@@ -215,7 +218,7 @@ process groups, cancellation, stdout/stderr event capture, and status updates.
 - Agent sessions are headless one-shot sessions; same-session steering is not
   implemented yet.
 - The TUI is an operator-console scaffold, not a full interactive platform.
-- No detached/background daemon supervisor exists yet.
+- Detached daemon crash restart policy and daemon log tailing are not complete.
 - No Python packaging metadata yet.
 
 ## Contributing

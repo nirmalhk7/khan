@@ -112,7 +112,7 @@ Session status values include:
 - `failed`
 - `cancelled`
 
-## TUI
+## Queue And Daemon
 
 ```bash
 khan queue list
@@ -120,14 +120,32 @@ khan queue work --once
 khan queue work
 khan queue cancel <queue-item-id>
 khan queue requeue <queue-item-id>
-khan daemon
+khan daemon start
+khan daemon status
+khan daemon stop
+khan daemon run
+```
+
+Use `--config <path>` with daemon commands when the daemon should use a
+non-default config and state store:
+
+```bash
+khan daemon start --config ./khan.yaml
+khan daemon status --config ./khan.yaml
+khan daemon stop --config ./khan.yaml
+```
+
+## Attention And TUI
+
+```bash
 khan tui
 khan attention
 khan metrics
 ```
 
-`queue work --once` processes at most one item. `queue work` and `daemon` run a
-foreground worker loop.
+`queue work --once` processes at most one item. `queue work` runs a foreground
+worker loop. `daemon start` launches a detached background daemon, while
+`daemon run` is the foreground child loop used by the supervisor.
 
 The TUI currently shows registered projects, recent task runs, recent agent
 sessions, and active work. It is a scaffold for the operator console and does
