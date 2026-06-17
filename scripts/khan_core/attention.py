@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from .models import AgentSessionRecord, DecisionCard, QueueItemRecord, RunRecord
+from .models import AgentSessionRecord, DaemonRecord, DecisionCard, QueueItemRecord, RunRecord
 from .store import Store
 
 
@@ -19,6 +19,8 @@ class AttentionRouter:
             cards.append(self._session_card(session))
         for item in self.store.list_queue_items(limit=200):
             cards.append(self._queue_card(item))
+        for daemon in self.store.list_daemons(limit=20):
+            cards.append(self._daemon_card(daemon))
         return sorted(cards, key=lambda card: card.score, reverse=True)
 
     def metrics(self) -> dict[str, Any]:
@@ -28,6 +30,8 @@ class AttentionRouter:
         run_statuses = Counter(run.status for run in runs)
         session_statuses = Counter(session.status for session in sessions)
         queue_statuses = Counter(item.status for item in queue_items)
+        daemons = self.store.list_daemons(limit=100)
+        daemon_statuses = Counter(daemon.status for daemon in daemons)
         decision_cards = self.cards()
         return {
             "runs": {
@@ -55,6 +59,12 @@ class AttentionRouter:
                 "queued": queue_statuses.get("queued", 0),
                 "running": queue_statuses.get("running", 0),
                 "failed": queue_statuses.get("failed", 0),
+            },
+            "daemons": {
+                "total": len(daemons),
+                "status_counts": dict(sorted(daemon_statuses.items())),
+                "running": daemon_statuses.get("running", 0),
+                "failed": daemon_statuses.get("failed", 0),
             },
         }
 
@@ -163,4 +173,35 @@ class AttentionRouter:
             summary=f"Queue item {item.id[:8]} is {item.status}.",
             evidence=[f"kind={item.kind}", f"status={item.status}", f"attempts={item.attempts}"],
             recommended_actions=[f"khan queue list --status {item.status}"],
+        )
+
+    def _daemon_card(self, daemon: DaemonRecord) -> DecisionCard:
+        if daemon.status == "failed":
+            return DecisionCard(
+                run_id=daemon.id,
+                subject_type="daemon",
+                classification="stopped",
+                score=80,
+                summary=daemon.error or f"Daemon {daemon.id[:8]} failed.",
+                evidence=[f"pid={daemon.pid}", f"status={daemon.status}"],
+                recommended_actions=["khan daemon status", "khan daemon start"],
+            )
+        if daemon.status in {"running", "stopping"}:
+            return DecisionCard(
+                run_id=daemon.id,
+                subject_type="daemon",
+                classification="watch",
+                score=35 if daemon.status == "running" else 65,
+                summary=f"Daemon {daemon.id[:8]} is {daemon.status}.",
+                evidence=[f"pid={daemon.pid}", f"heartbeat={daemon.heartbeat_at.isoformat()}"],
+                recommended_actions=["khan daemon status", f"khan daemon stop --daemon-id {daemon.id}"],
+            )
+        return DecisionCard(
+            run_id=daemon.id,
+            subject_type="daemon",
+            classification="healthy",
+            score=1,
+            summary=f"Daemon {daemon.id[:8]} is {daemon.status}.",
+            evidence=[f"pid={daemon.pid}", f"status={daemon.status}"],
+            recommended_actions=["khan daemon status"],
         )

@@ -5,7 +5,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -14,6 +14,8 @@ from .models import (
     AgentSessionEvent,
     AgentSessionRecord,
     AgentSessionStatus,
+    DaemonRecord,
+    DaemonStatus,
     EventRecord,
     QueueItemKind,
     QueueItemRecord,
@@ -92,6 +94,17 @@ MIGRATIONS = [
     );
     CREATE INDEX queue_items_status_priority ON queue_items(status, priority, created_at);
     CREATE INDEX queue_items_lease ON queue_items(status, leased_at);
+    """,
+    """
+    CREATE TABLE daemon_processes (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, status TEXT NOT NULL, command TEXT NOT NULL,
+      poll_seconds REAL NOT NULL, lease_timeout_seconds REAL NOT NULL,
+      started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, stopped_at TEXT, error TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX daemon_processes_status ON daemon_processes(status, heartbeat_at);
+    """,
+    """
+    ALTER TABLE daemon_processes ADD COLUMN last_queue_item_id TEXT;
     """,
 ]
 
@@ -363,6 +376,17 @@ class Store:
             conn.commit()
         return self._queue_item_from_row(updated)
 
+    def reclaim_stale_queue_items(self, older_than_seconds: float) -> int:
+        threshold = (datetime.now(UTC) - timedelta(seconds=older_than_seconds)).isoformat()
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """UPDATE queue_items SET status='queued', lease_owner=NULL, leased_at=NULL,
+                   error='', updated_at=? WHERE status='running' AND leased_at IS NOT NULL AND leased_at < ?""",
+                (now, threshold),
+            )
+            return cursor.rowcount
+
     def heartbeat_queue_item(self, item_id: str, worker_id: str) -> None:
         now = datetime.now(UTC).isoformat()
         with self._connect() as conn:
@@ -412,6 +436,111 @@ class Store:
                 **dict(row),
                 "payload": json.loads(row["payload"]),
                 "leased_at": datetime.fromisoformat(row["leased_at"]) if row["leased_at"] else None,
+            }
+        )
+
+    def create_daemon(
+        self,
+        pid: int,
+        command: list[str],
+        poll_seconds: float,
+        lease_timeout_seconds: float,
+        *,
+        daemon_id: str | None = None,
+    ) -> DaemonRecord:
+        now = datetime.now(UTC)
+        record = DaemonRecord(
+            id=daemon_id or str(uuid.uuid4()),
+            pid=pid,
+            status="running",
+            command=command,
+            poll_seconds=poll_seconds,
+            lease_timeout_seconds=lease_timeout_seconds,
+            started_at=now,
+            heartbeat_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO daemon_processes
+                (id,pid,status,command,poll_seconds,lease_timeout_seconds,started_at,heartbeat_at,stopped_at,error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '')""",
+                (
+                    record.id,
+                    record.pid,
+                    record.status,
+                    json.dumps(record.command),
+                    record.poll_seconds,
+                    record.lease_timeout_seconds,
+                    record.started_at.isoformat(),
+                    record.heartbeat_at.isoformat(),
+                ),
+            )
+        return record
+
+    def get_daemon(self, daemon_id: str) -> DaemonRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM daemon_processes WHERE id = ?", (daemon_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Daemon not found: {daemon_id}")
+        return self._daemon_from_row(row)
+
+    def list_daemons(self, active_only: bool = False, limit: int = 20) -> list[DaemonRecord]:
+        query = "SELECT * FROM daemon_processes"
+        params: tuple = ()
+        if active_only:
+            query += " WHERE status IN ('running', 'stopping')"
+        query += " ORDER BY started_at DESC LIMIT ?"
+        params = (limit,)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._daemon_from_row(row) for row in rows]
+
+    def heartbeat_daemon(self, daemon_id: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_processes SET heartbeat_at=? WHERE id=? AND status='running'",
+                (now, daemon_id),
+            )
+
+    def update_daemon_last_item(self, daemon_id: str, queue_item_id: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE daemon_processes SET last_queue_item_id=?, heartbeat_at=?
+                   WHERE id=? AND status='running'""",
+                (queue_item_id, now, daemon_id),
+            )
+
+    def request_daemon_stop(self, daemon_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_processes SET status='stopping', heartbeat_at=? WHERE id=? AND status='running'",
+                (datetime.now(UTC).isoformat(), daemon_id),
+            )
+
+    def finish_daemon(self, daemon_id: str, status: DaemonStatus, error: str = "") -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE daemon_processes SET status=?, stopped_at=?, heartbeat_at=?, error=?
+                   WHERE id=?""",
+                (status, now, now, error, daemon_id),
+            )
+
+    def should_stop_daemon(self, daemon_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT status FROM daemon_processes WHERE id = ?", (daemon_id,)).fetchone()
+        return row is not None and row["status"] == "stopping"
+
+    def _daemon_from_row(self, row: sqlite3.Row) -> DaemonRecord:
+        return DaemonRecord.model_validate(
+            {
+                **dict(row),
+                "command": json.loads(row["command"]),
+                "started_at": datetime.fromisoformat(row["started_at"]),
+                "heartbeat_at": datetime.fromisoformat(row["heartbeat_at"]),
+                "stopped_at": datetime.fromisoformat(row["stopped_at"]) if row["stopped_at"] else None,
             }
         )
 

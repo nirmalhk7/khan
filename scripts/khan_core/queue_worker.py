@@ -17,16 +17,30 @@ class QueueWorkerError(RuntimeError):
 
 
 class QueueWorker:
-    def __init__(self, config_path: Path | None = None, worker_id: str | None = None) -> None:
+    def __init__(
+        self,
+        config_path: Path | None = None,
+        worker_id: str | None = None,
+        *,
+        daemon_id: str | None = None,
+        lease_timeout_seconds: float = 900,
+    ) -> None:
         self.config_path = config_path
         self.config = load_config(config_path)
         self.store = Store(self.config.global_config.state_dir)
         self.worker_id = worker_id or f"{socket.gethostname()}-{uuid.uuid4()}"
+        self.daemon_id = daemon_id
+        self.lease_timeout_seconds = lease_timeout_seconds
 
     def process_once(self) -> QueueItemRecord | None:
+        self.store.reclaim_stale_queue_items(self.lease_timeout_seconds)
+        if self.daemon_id:
+            self.store.heartbeat_daemon(self.daemon_id)
         item = self.store.claim_next_queue_item(self.worker_id)
         if item is None:
             return None
+        if self.daemon_id:
+            self.store.update_daemon_last_item(self.daemon_id, item.id)
         try:
             result_id = self._execute(item)
         except Exception as exc:
@@ -37,10 +51,18 @@ class QueueWorker:
             return self.store.get_queue_item(item.id)
 
     def run_forever(self, poll_seconds: float = 2.0) -> None:
-        while True:
-            item = self.process_once()
-            if item is None:
-                time.sleep(poll_seconds)
+        try:
+            while True:
+                if self.daemon_id and self.store.should_stop_daemon(self.daemon_id):
+                    self.store.finish_daemon(self.daemon_id, "stopped")
+                    return
+                item = self.process_once()
+                if item is None:
+                    time.sleep(poll_seconds)
+        except Exception as exc:
+            if self.daemon_id:
+                self.store.finish_daemon(self.daemon_id, "failed", f"{type(exc).__name__}: {exc}")
+            raise
 
     def _execute(self, item: QueueItemRecord) -> str:
         if item.kind == "task":

@@ -16,6 +16,7 @@ from khan_core.agent_adapters import AgentAdapterRegistry, AgentCommand, JsonlAg
 from khan_core.agents import AgentSessionRunner
 from khan_core.attention import AttentionRouter
 from khan_core.codex_cli import CodexCLI, CodexCancelled
+from khan_core.daemon import DaemonSupervisor
 from khan_core.loop_engine import LoopEngine
 from khan_core.models import AgentSessionEvent, ProjectConfig, RunProcess, TaskCapsule
 from khan_core.queue_worker import QueueWorker, QueueWorkerError
@@ -83,7 +84,7 @@ class FoundationTests(unittest.TestCase):
     def test_migrations_and_run_lock(self) -> None:
         store = Store(self.root / "state")
         with store._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
         task = store.create_task("p", "t", "p", "s", None)
         run = store.create_run(task.id, "p", str(self.root))
         with store.run_lock(run.id):
@@ -110,7 +111,7 @@ class FoundationTests(unittest.TestCase):
             """)
         store = Store(state)
         with store._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
         self.assertIn("process_id", columns)
 
@@ -296,6 +297,7 @@ projects:
         session = store.create_agent_session("cursor-agent", "p", str(self.root), "prompt")
         store.start_agent_session(session.id, 1234)
         item = store.enqueue_task(task.id)
+        daemon = store.create_daemon(12345, ["khan", "daemon", "run"], 2.0, 900.0)
 
         router = AttentionRouter(store)
         cards = router.cards()
@@ -305,7 +307,9 @@ projects:
         self.assertEqual(metrics["runs"]["needs_human"], 1)
         self.assertEqual(metrics["sessions"]["active"], 1)
         self.assertEqual(metrics["queue"]["queued"], 1)
+        self.assertEqual(metrics["daemons"]["running"], 1)
         self.assertTrue(any(card.subject_type == "queue" and card.run_id == item.id for card in cards))
+        self.assertTrue(any(card.subject_type == "daemon" and card.run_id == daemon.id for card in cards))
 
     def test_queue_claim_requeue_and_cancel_lifecycle(self) -> None:
         store = Store(self.root / "state")
@@ -325,6 +329,71 @@ projects:
 
         store.cancel_queue_item(first.id)
         self.assertEqual(store.get_queue_item(first.id).status, "cancelled")
+
+    def test_stale_queue_leases_are_reclaimed(self) -> None:
+        store = Store(self.root / "state")
+        task = store.create_task("p", "title", "prompt", "success", None)
+        item = store.enqueue_task(task.id)
+        claimed = store.claim_next_queue_item("worker-1")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE queue_items SET leased_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", claimed.id),
+            )
+        reclaimed = store.reclaim_stale_queue_items(older_than_seconds=60)
+        self.assertEqual(reclaimed, 1)
+        loaded = store.get_queue_item(item.id)
+        self.assertEqual(loaded.status, "queued")
+        self.assertIsNone(loaded.lease_owner)
+        self.assertIsNone(loaded.leased_at)
+
+    def test_daemon_store_lifecycle_and_worker_stop(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+projects: {{}}
+""")
+        store = Store(state)
+        daemon = store.create_daemon(123, ["khan", "daemon", "run"], 0.1, 60.0, daemon_id="daemon-1")
+        self.assertEqual(store.get_daemon(daemon.id).status, "running")
+        store.request_daemon_stop(daemon.id)
+        worker = QueueWorker(config, worker_id="test-worker", daemon_id=daemon.id)
+        worker.run_forever(poll_seconds=0.01)
+        stopped = store.get_daemon(daemon.id)
+        self.assertEqual(stopped.status, "stopped")
+        self.assertIsNotNone(stopped.stopped_at)
+
+    def test_daemon_supervisor_start_status_stop(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects: {{}}
+""")
+        supervisor = DaemonSupervisor(config)
+        daemon = supervisor.start(poll_seconds=0.1, lease_timeout_seconds=1.0)
+        try:
+            time.sleep(0.3)
+            statuses = {record.id: record.status for record in supervisor.status()}
+            self.assertEqual(statuses[daemon.id], "running")
+        finally:
+            stopped = supervisor.stop(daemon.id)
+        self.assertIn(stopped.status, {"stopping", "stopped"})
 
     def test_queue_worker_processes_session_items(self) -> None:
         state = self.root / "state"
@@ -348,7 +417,8 @@ projects:
 """)
         store = Store(state)
         item = store.enqueue_session("cursor-agent", "p", "queued prompt")
-        worker = QueueWorker(config, worker_id="test-worker")
+        daemon = store.create_daemon(123, ["khan", "daemon", "run"], 0.1, 60.0, daemon_id="daemon-1")
+        worker = QueueWorker(config, worker_id="test-worker", daemon_id=daemon.id)
         processed = worker.process_once()
         self.assertEqual(processed.id, item.id)
         self.assertEqual(processed.status, "succeeded")
@@ -356,6 +426,7 @@ projects:
         session = store.get_agent_session(processed.result_id)
         self.assertEqual(session.status, "succeeded")
         self.assertEqual(session.external_id, "cursor-chat")
+        self.assertEqual(store.get_daemon(daemon.id).last_queue_item_id, item.id)
 
     def test_queue_worker_records_failures(self) -> None:
         state = self.root / "state"

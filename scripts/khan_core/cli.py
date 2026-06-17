@@ -12,6 +12,7 @@ from .agent_adapters import agent_adapter_names
 from .agents import AgentSessionError, AgentSessionRunner
 from .attention import AttentionRouter
 from .config import discover_project, load_config, save_config, write_default_config
+from .daemon import DaemonSupervisor, DaemonSupervisorError
 from .doctor import run_doctor
 from .loop_engine import LoopEngine
 from .models import AgentProvider, TaskCapsule
@@ -27,11 +28,13 @@ task_app = typer.Typer(no_args_is_help=True, help="Create and run durable Codex 
 run_app = typer.Typer(no_args_is_help=True, help="Inspect and control task-loop runs.")
 session_app = typer.Typer(no_args_is_help=True, help="Start and inspect provider-neutral agent sessions.")
 queue_app = typer.Typer(no_args_is_help=True, help="Manage Khan's durable work queue.")
+daemon_app = typer.Typer(no_args_is_help=True, help="Manage Khan's detached daemon supervisor.")
 app.add_typer(project_app, name="project")
 app.add_typer(task_app, name="task")
 app.add_typer(run_app, name="run")
 app.add_typer(session_app, name="session")
 app.add_typer(queue_app, name="queue")
+app.add_typer(daemon_app, name="daemon")
 
 console = Console()
 
@@ -393,12 +396,71 @@ def queue_work(
     worker.run_forever(poll_seconds=poll_seconds)
 
 
-@app.command()
-def daemon(poll_seconds: float = 2.0) -> None:
+@daemon_app.command("run")
+def daemon_run(
+    daemon_id: str | None = typer.Option(None, "--daemon-id"),
+    poll_seconds: float = typer.Option(2.0, "--poll-seconds"),
+    lease_timeout_seconds: float = typer.Option(900.0, "--lease-timeout-seconds"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path for supervised daemon children."),
+) -> None:
     """Run Khan's foreground daemon loop."""
-    worker = QueueWorker()
+    worker = QueueWorker(config, daemon_id=daemon_id, lease_timeout_seconds=lease_timeout_seconds)
     console.print(f"Starting Khan daemon {worker.worker_id}")
     worker.run_forever(poll_seconds=poll_seconds)
+
+
+@daemon_app.command("start")
+def daemon_start(
+    poll_seconds: float = typer.Option(2.0, "--poll-seconds"),
+    lease_timeout_seconds: float = typer.Option(900.0, "--lease-timeout-seconds"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path for the daemon process."),
+) -> None:
+    """Start Khan's daemon as a detached background process."""
+    try:
+        daemon = DaemonSupervisor(config).start(
+            poll_seconds=poll_seconds,
+            lease_timeout_seconds=lease_timeout_seconds,
+        )
+    except DaemonSupervisorError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Started Khan daemon {daemon.id} pid={daemon.pid}")
+
+
+@daemon_app.command("status")
+def daemon_status(
+    config: Path | None = typer.Option(None, "--config", help="Config file path for the daemon state store."),
+) -> None:
+    """List recent daemon process records."""
+    table = Table(title="Daemons")
+    table.add_column("Daemon")
+    table.add_column("PID")
+    table.add_column("Status")
+    table.add_column("Heartbeat")
+    table.add_column("Last Item")
+    table.add_column("Error")
+    for daemon in DaemonSupervisor(config).status():
+        table.add_row(
+            daemon.id[:8],
+            str(daemon.pid),
+            daemon.status,
+            daemon.heartbeat_at.isoformat(),
+            daemon.last_queue_item_id[:8] if daemon.last_queue_item_id else "-",
+            daemon.error or "-",
+        )
+    console.print(table)
+
+
+@daemon_app.command("stop")
+def daemon_stop(
+    daemon_id: str | None = typer.Option(None, "--daemon-id"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path for the daemon state store."),
+) -> None:
+    """Stop an active Khan daemon."""
+    try:
+        daemon = DaemonSupervisor(config).stop(daemon_id)
+    except DaemonSupervisorError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Stop requested for daemon {daemon.id} status={daemon.status}")
 
 
 @app.command()

@@ -19,6 +19,7 @@ AgentSessionStatus = Literal[
 
 QueueItemKind = Literal["task", "session"]
 QueueItemStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
+DaemonStatus = Literal["running", "stopping", "stopped", "failed"]
 
 RunStatus = Literal[
     "queued",
@@ -170,6 +171,20 @@ class QueueItemRecord(BaseModel):
     updated_at: datetime
 
 
+class DaemonRecord(BaseModel):
+    id: str
+    pid: int
+    status: DaemonStatus
+    command: list[str] = Field(default_factory=list)
+    poll_seconds: float = 2.0
+    lease_timeout_seconds: float = 900.0
+    started_at: datetime
+    heartbeat_at: datetime
+    stopped_at: datetime | None = None
+    last_queue_item_id: str | None = None
+    error: str = ""
+
+
 class WorkerResult(BaseModel):
     status: Literal["done", "blocked", "needs_review", "needs_human"]
     summary: str
@@ -225,7 +240,7 @@ class TaskCapsule(BaseModel):
 
 class DecisionCard(BaseModel):
     run_id: str
-    subject_type: Literal["run", "session", "queue"] = "run"
+    subject_type: Literal["run", "session", "queue", "daemon"] = "run"
     classification: Literal["healthy", "watch", "decision_required", "stopped"]
     score: int
     summary: str
