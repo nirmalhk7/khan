@@ -18,6 +18,9 @@ and recoverable agent sessions.
 - Task capsules with acceptance criteria, expected files, allowed paths,
   protected paths, verification recipes, blast radius, dependencies, and conflict
   domains.
+- Zero-friction `khan ask <project-or-path> "prompt"` for broad local tasks,
+  with git-root project auto-discovery, validation inference, immediate run, and
+  enqueue mode.
 - Conflict-domain scheduling guard for active task runs.
 - Durable queue items for task runs and agent sessions.
 - Foreground queue worker, detached daemon supervisor, daemon heartbeat/status,
@@ -26,6 +29,22 @@ and recoverable agent sessions.
 - Provider-neutral agent sessions with built-in `codex` and `cursor-agent`
   adapters.
 - Adapter registry for future providers.
+- Provider duel records with `khan duel run <project-or-path> "prompt"`,
+  `khan duel list`, `khan duel show`, and `khan duel artifacts`.
+- Duel participants run through the adapter layer in isolated git worktrees and
+  capture transcript, changed files including untracked files, diff stat,
+  validation result, runtime, summary, open risks, and participant artifacts.
+- `duel-report.md` compares provider candidates and duels appear in attention
+  cards and metrics.
+- Manual `khan adopt` and `khan reject` for run, session, and duel participant
+  workspaces, with dirty-destination refusal, optional source cleanup, protected
+  path summaries, failed-attempt recording, and `khan adoption list`.
+- Cross-review records with `khan cross-review <duel-id>`,
+  `khan cross-review-list`, `khan cross-review-show`, and
+  `khan cross-review-artifacts`.
+- Cross-review critiques run each completed duel provider against the other
+  provider's diff through the adapter/session layer and store critique artifacts
+  plus a `cross-review-report.md`.
 - macOS `say` notification when task runs enter `needs_human`.
 - Attention router and JSON metrics command.
 - CLI docs, README, configuration docs, adapter docs, and operations docs.
@@ -35,43 +54,26 @@ and recoverable agent sessions.
 
 ### 1. Zero-Friction Local Tasks
 
-- Add `khan ask . "prompt"` for current-repo one-off work without requiring
-  `khan project add`.
-- Auto-create an ephemeral project config from the current git root.
-- Infer validation commands from the repo and persist the inferred recipe in the
-  run artifacts.
 - Add `khan last`, `khan ps`, `khan diff <id>`, `khan summary <id>`, and
   unambiguous partial ID resolution.
+- Add richer `ask` planning modes, including optional duel-backed ask and
+  explicit evidence rendering after the run completes.
 
-### 2. Provider Duel Mode
+### 2. Provider Duel Polish
 
-- Add `khan duel . "prompt"` to run Codex and Cursor Agent against the same task
-  capsule in isolated sibling worktrees.
-- Store one parent duel record and one child run/session per provider.
-- Capture for each provider:
-  - prompt
-  - transcript
-  - changed files
-  - diff stat
-  - validation result
-  - runtime
-  - summary
-  - open risks
-- Produce `duel-report.md` comparing both outputs.
-- Add `khan duel show <id>` and `khan duel artifacts <id>`.
+- Run duel participants concurrently once scheduler support can preserve
+  deterministic tests and clear output.
+- Attach task capsules directly to duels instead of storing only the prompt.
+- Add richer winner heuristics that account for validation, review findings,
+  diff size, protected paths, and operator adoption history.
 
-### 3. Cross-Review Mode
+### 3. Cross-Review Polish
 
-- Add `khan cross-review <duel-id>`.
-- Have Codex review Cursor Agent's diff.
-- Have Cursor Agent review Codex's diff using the same review prompt.
-- Store both critiques as artifacts.
-- Add a final Khan decision card with:
-  - strongest implementation
-  - validation winner
-  - reviewer disagreements
-  - files requiring human inspection
-  - recommended adopt/reject action
+- Parse reviewer verdicts into structured strongest-implementation,
+  reviewer-disagreement, and required-human-inspection fields.
+- Feed cross-review findings back into adopt/reject warnings.
+- Add optional automatic adoption recommendation from validation plus
+  cross-review results.
 
 ### 4. Relay Mode
 
@@ -84,18 +86,14 @@ and recoverable agent sessions.
   - `codex-fix cursor-polish`
 - Persist every handoff prompt as an artifact so relays are inspectable.
 
-### 5. Patch Adoption Workflow
+### 5. Patch Adoption Polish
 
-- Add `khan adopt <run-id>` to copy a selected run's worktree changes into the
-  main checkout.
-- Add `khan reject <run-id>` to discard the worktree and mark the result rejected.
-- Add `khan adopt <duel-id> --provider codex|cursor-agent`.
-- Before adoption:
-  - show changed files
-  - show validation status
-  - warn on protected paths
-  - refuse adoption if the destination worktree is dirty unless `--force`
-- Record adoption decisions in SQLite.
+- Add `khan diff <id>` preview before adoption.
+- Add an interactive confirmation flow that shows changed files, validation
+  status, protected-path warnings, and destination dirty state.
+- Add optional post-adoption validation.
+- Add optional commit creation after adoption.
+- Add a retention policy for accepted/rejected worktrees.
 
 ### 6. Replay And Benchmarking
 
@@ -168,7 +166,7 @@ and recoverable agent sessions.
 
 ## Test Plan
 
-- CLI tests for `ask`, partial IDs, `duel`, `cross-review`, `relay`, `adopt`,
+- CLI tests for partial IDs, `duel`, `cross-review`, `relay`, `adopt`,
   `reject`, `replay`, `bench`, and `explain`.
 - Store migration tests for duel records, adoption decisions, replay metadata,
   and evidence artifacts.

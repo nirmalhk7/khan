@@ -10,13 +10,20 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
+from typer.testing import CliRunner
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from khan_core.agent_adapters import AgentAdapterRegistry, AgentCommand, JsonlAgentAdapter
 from khan_core.agents import AgentSessionRunner
+from khan_core.adoption import AdoptionError, AdoptionManager
 from khan_core.attention import AttentionRouter
+from khan_core.cli import app
 from khan_core.codex_cli import CodexCLI, CodexCancelled
+from khan_core.config import load_config
+from khan_core.cross_review import CrossReviewRunner
 from khan_core.daemon import DaemonSupervisor
+from khan_core.duel import DuelRunner
 from khan_core.loop_engine import LoopEngine
 from khan_core.models import AgentSessionEvent, ProjectConfig, RunProcess, TaskCapsule
 from khan_core.queue_worker import QueueWorker, QueueWorkerError
@@ -47,13 +54,18 @@ out.write_text(json.dumps({
 """
 
 FAKE_CURSOR = r"""#!/usr/bin/env python3
-import json, pathlib, sys
+import json, os, pathlib, sys
 args = sys.argv[1:]
 if "--version" in args:
     print("cursor-agent fake")
     raise SystemExit(0)
 workspace = pathlib.Path(args[args.index("--workspace") + 1])
 prompt = args[-1]
+change = os.environ.get("FAKE_CURSOR_CHANGE")
+if change:
+    path = workspace / change
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("cursor changed\n")
 print(json.dumps({"type": "session.started", "chatId": "cursor-chat", "text": "started"}), flush=True)
 print(json.dumps({"type": "message", "text": f"cursor done: {prompt[:20]}"}), flush=True)
 """
@@ -84,7 +96,7 @@ class FoundationTests(unittest.TestCase):
     def test_migrations_and_run_lock(self) -> None:
         store = Store(self.root / "state")
         with store._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
         task = store.create_task("p", "t", "p", "s", None)
         run = store.create_run(task.id, "p", str(self.root))
         with store.run_lock(run.id):
@@ -111,7 +123,7 @@ class FoundationTests(unittest.TestCase):
             """)
         store = Store(state)
         with store._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
         self.assertIn("process_id", columns)
 
@@ -298,6 +310,21 @@ projects:
         store.start_agent_session(session.id, 1234)
         item = store.enqueue_task(task.id)
         daemon = store.create_daemon(12345, ["khan", "daemon", "run"], 2.0, 900.0)
+        duel = store.create_duel("p", "prompt", ["codex", "cursor-agent"])
+        store.update_duel(duel.id, "awaiting_decision", "choose a provider")
+        store.create_adoption_decision(
+            target_type="duel",
+            target_id=duel.id,
+            provider="codex",
+            project="p",
+            source_workspace=str(self.root / "source"),
+            destination_workspace=str(self.root),
+            status="adopted",
+            changed_files=["docs/x.md"],
+            summary="adopted",
+        )
+        cross_review = store.create_cross_review(duel.id)
+        store.update_cross_review(cross_review.id, "awaiting_decision", "review complete")
 
         router = AttentionRouter(store)
         cards = router.cards()
@@ -308,8 +335,13 @@ projects:
         self.assertEqual(metrics["sessions"]["active"], 1)
         self.assertEqual(metrics["queue"]["queued"], 1)
         self.assertEqual(metrics["daemons"]["running"], 1)
+        self.assertEqual(metrics["duels"]["awaiting_decision"], 1)
+        self.assertEqual(metrics["adoptions"]["adopted"], 1)
+        self.assertEqual(metrics["cross_reviews"]["awaiting_decision"], 1)
         self.assertTrue(any(card.subject_type == "queue" and card.run_id == item.id for card in cards))
         self.assertTrue(any(card.subject_type == "daemon" and card.run_id == daemon.id for card in cards))
+        self.assertTrue(any(card.subject_type == "duel" and card.run_id == duel.id for card in cards))
+        self.assertTrue(any(card.subject_type == "cross_review" and card.run_id == cross_review.id for card in cards))
 
     def test_queue_claim_requeue_and_cancel_lifecycle(self) -> None:
         store = Store(self.root / "state")
@@ -485,6 +517,278 @@ projects:
         self.assertIn("cursor done", cursor_session.summary)
         cursor_events = runner.store.list_agent_session_events(cursor_session_id)
         self.assertTrue(any(event.message == "started" for event in cursor_events))
+
+    def test_provider_duel_runs_both_agents_and_writes_report(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+projects:
+  p:
+    name: p
+    path: {repo}
+    default_branch: main
+    workspace_mode: in_place
+    validate_commands:
+      - test -f base.txt
+    env:
+      FAKE_CHANGE: docs/codex.txt
+      FAKE_CURSOR_CHANGE: docs/cursor.txt
+""")
+        runner = DuelRunner(config)
+        duel = runner.run_duel("p", "Implement the feature.", validate=True)
+        self.assertEqual(duel.status, "awaiting_decision")
+        self.assertTrue(duel.report_path)
+        self.assertTrue(Path(duel.report_path).exists())
+        self.assertIn("Provider Comparison", Path(duel.report_path).read_text())
+
+        participants = runner.store.list_duel_participants(duel.id)
+        self.assertEqual({participant.provider for participant in participants}, {"codex", "cursor-agent"})
+        for participant in participants:
+            self.assertEqual(participant.status, "succeeded")
+            self.assertTrue(participant.session_id)
+            self.assertNotEqual(Path(participant.workspace), repo)
+            self.assertTrue(Path(participant.workspace).exists())
+            self.assertTrue(participant.validation_ok)
+            self.assertTrue(Path(participant.artifact_path).exists())
+
+        by_provider = {participant.provider: participant for participant in participants}
+        self.assertEqual(by_provider["codex"].changed_files, ["docs/codex.txt"])
+        self.assertEqual(by_provider["cursor-agent"].changed_files, ["docs/cursor.txt"])
+        artifacts = [path.name for path in runner.store.list_artifacts(duel.id)]
+        self.assertIn("duel-report.md", artifacts)
+        self.assertIn("codex-result.md", artifacts)
+        self.assertIn("cursor-agent-result.md", artifacts)
+
+    def test_cross_review_runs_each_provider_against_other_diff(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 4
+notifications:
+  input_needed: false
+projects:
+  p:
+    name: p
+    path: {repo}
+    default_branch: main
+    workspace_mode: in_place
+    env:
+      FAKE_CHANGE: docs/codex.txt
+      FAKE_CURSOR_CHANGE: docs/cursor.txt
+""")
+        duel_runner = DuelRunner(config)
+        duel = duel_runner.run_duel("p", "Implement competing changes.", validate=False)
+        review = CrossReviewRunner(config).run_cross_review(duel.id)
+        self.assertEqual(review.status, "awaiting_decision")
+        self.assertTrue(Path(review.report_path).exists())
+        self.assertIn("Cross-Review Report", Path(review.report_path).read_text())
+
+        critiques = duel_runner.store.list_cross_review_critiques(review.id)
+        pairs = {(critique.reviewer_provider, critique.subject_provider) for critique in critiques}
+        self.assertEqual(pairs, {("codex", "cursor-agent"), ("cursor-agent", "codex")})
+        for critique in critiques:
+            self.assertEqual(critique.status, "succeeded")
+            self.assertTrue(critique.session_id)
+            self.assertTrue(critique.findings)
+            self.assertTrue(Path(critique.artifact_path).exists())
+        artifacts = [path.name for path in duel_runner.store.list_artifacts(review.id)]
+        self.assertIn("cross-review-report.md", artifacts)
+        self.assertIn("codex-reviews-cursor-agent.md", artifacts)
+        self.assertIn("cursor-agent-reviews-codex.md", artifacts)
+
+    def test_adopt_and_reject_duel_participants(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+projects:
+  p:
+    name: p
+    path: {repo}
+    default_branch: main
+    workspace_mode: in_place
+    env:
+      FAKE_CHANGE: docs/codex.txt
+      FAKE_CURSOR_CHANGE: docs/cursor.txt
+""")
+        duel = DuelRunner(config).run_duel("p", "Implement both options.", validate=False)
+        manager = AdoptionManager(config)
+        adopted = manager.adopt(duel.id, provider="codex")
+        self.assertEqual(adopted.status, "adopted")
+        self.assertEqual(adopted.changed_files, ["docs/codex.txt"])
+        self.assertEqual((repo / "docs" / "codex.txt").read_text(), "changed\n")
+        self.assertEqual(manager.store.get_duel(duel.id).status, "adopted")
+        self.assertEqual(manager.store.get_duel_participant(duel.id, "codex").status, "adopted")
+
+        with self.assertRaisesRegex(AdoptionError, "Destination worktree is dirty"):
+            manager.adopt(duel.id, provider="cursor-agent")
+        failed = manager.store.list_adoption_decisions()[0]
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("dirty", failed.error)
+        self.assertFalse((repo / "docs" / "cursor.txt").exists())
+
+        cursor_workspace = Path(manager.store.get_duel_participant(duel.id, "cursor-agent").workspace)
+        self.assertTrue(cursor_workspace.exists())
+        rejected = manager.reject(duel.id, provider="cursor-agent")
+        self.assertEqual(rejected.status, "rejected")
+        self.assertFalse(cursor_workspace.exists())
+        self.assertEqual(manager.store.get_duel_participant(duel.id, "cursor-agent").status, "rejected")
+        self.assertEqual(manager.store.get_duel(duel.id).status, "adopted")
+
+    def test_duel_cli_run_path_form_auto_discovers_project(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+projects: {{}}
+""")
+        result = CliRunner().invoke(app, ["duel", "run", str(repo), "Implement via CLI.", "--config", str(config)])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("finished with status awaiting_decision", result.output)
+        loaded = load_config(config)
+        self.assertEqual(len(loaded.projects), 1)
+        store = Store(state)
+        duel = store.list_duels()[0]
+        self.assertEqual(duel.status, "awaiting_decision")
+
+    def test_ask_cli_auto_discovers_project_and_runs_task(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "Makefile").write_text("test:\n\ttrue\n")
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects: {{}}
+""")
+        result = CliRunner().invoke(
+            app,
+            ["ask", str(repo), "Implement a broad local task.", "--config", str(config)],
+            env={"FAKE_CHANGE": "docs/ask.txt"},
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("finished with status succeeded", result.output)
+        loaded = load_config(config)
+        self.assertEqual(len(loaded.projects), 1)
+        project = next(iter(loaded.projects.values()))
+        self.assertEqual(project.validate_commands, ["make test"])
+        store = Store(state)
+        task = store.list_tasks()[0]
+        capsule = store.get_task_capsule(task.id)
+        self.assertEqual(capsule.verification, ["make test"])
+        self.assertEqual(capsule.conflict_domains, [project.name])
+        run = store.list_runs()[0]
+        self.assertEqual(run.status, "succeeded")
+
+    def test_ask_cli_enqueue_mode_creates_queue_item(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+projects: {{}}
+""")
+        result = CliRunner().invoke(
+            app,
+            ["ask", str(repo), "Queue this local task.", "--enqueue", "--priority", "5", "--config", str(config)],
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("queued item", result.output)
+        store = Store(state)
+        items = store.list_queue_items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].kind, "task")
+        self.assertEqual(items[0].priority, 5)
 
     def test_custom_agent_adapter_can_be_registered(self) -> None:
         class FakeAgentAdapter(JsonlAgentAdapter):

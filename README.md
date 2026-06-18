@@ -294,4 +294,3 @@ The CLI wrapper is `khan`. The internal Python entrypoint remains:
 ```bash
 python scripts/khan_cli.py ...
 ```
-# khan

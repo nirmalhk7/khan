@@ -14,8 +14,19 @@ from .models import (
     AgentSessionEvent,
     AgentSessionRecord,
     AgentSessionStatus,
+    AdoptionRecord,
+    AdoptionStatus,
+    AdoptionTargetType,
+    CrossReviewCritiqueRecord,
+    CrossReviewCritiqueStatus,
+    CrossReviewRecord,
+    CrossReviewStatus,
     DaemonRecord,
     DaemonStatus,
+    DuelParticipantRecord,
+    DuelParticipantStatus,
+    DuelRecord,
+    DuelStatus,
     EventRecord,
     QueueItemKind,
     QueueItemRecord,
@@ -106,6 +117,53 @@ MIGRATIONS = [
     """
     ALTER TABLE daemon_processes ADD COLUMN last_queue_item_id TEXT;
     """,
+    """
+    CREATE TABLE duels (
+      id TEXT PRIMARY KEY, project TEXT NOT NULL, prompt TEXT NOT NULL, providers TEXT NOT NULL,
+      status TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', report_path TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE duel_participants (
+      duel_id TEXT NOT NULL, provider TEXT NOT NULL, session_id TEXT, status TEXT NOT NULL,
+      workspace TEXT NOT NULL DEFAULT '', changed_files TEXT NOT NULL DEFAULT '[]',
+      diff_stat TEXT NOT NULL DEFAULT '', validation_ok INTEGER, validation_summary TEXT NOT NULL DEFAULT '',
+      runtime_seconds REAL NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '',
+      open_risks TEXT NOT NULL DEFAULT '[]', artifact_path TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (duel_id, provider)
+    );
+    CREATE INDEX duels_project_status ON duels(project, status, updated_at);
+    CREATE INDEX duel_participants_session_id ON duel_participants(session_id);
+    """,
+    """
+    CREATE TABLE adoption_decisions (
+      id TEXT PRIMARY KEY, target_type TEXT NOT NULL, target_id TEXT NOT NULL,
+      provider TEXT, session_id TEXT, project TEXT NOT NULL,
+      source_workspace TEXT NOT NULL, destination_workspace TEXT NOT NULL,
+      status TEXT NOT NULL, changed_files TEXT NOT NULL DEFAULT '[]',
+      summary TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX adoption_decisions_target ON adoption_decisions(target_type, target_id, created_at);
+    CREATE INDEX adoption_decisions_project ON adoption_decisions(project, created_at);
+    """,
+    """
+    CREATE TABLE cross_reviews (
+      id TEXT PRIMARY KEY, duel_id TEXT NOT NULL, status TEXT NOT NULL,
+      summary TEXT NOT NULL DEFAULT '', report_path TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE cross_review_critiques (
+      cross_review_id TEXT NOT NULL, duel_id TEXT NOT NULL,
+      reviewer_provider TEXT NOT NULL, subject_provider TEXT NOT NULL,
+      session_id TEXT, status TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',
+      findings TEXT NOT NULL DEFAULT '[]', artifact_path TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (cross_review_id, reviewer_provider, subject_provider)
+    );
+    CREATE INDEX cross_reviews_duel_status ON cross_reviews(duel_id, status, updated_at);
+    CREATE INDEX cross_review_critiques_session_id ON cross_review_critiques(session_id);
+    """,
 ]
 
 ACTIVE_STATUSES = (
@@ -113,6 +171,8 @@ ACTIVE_STATUSES = (
     "validating", "reviewing", "retryable_failure", "awaiting_decision",
 )
 ACTIVE_AGENT_SESSION_STATUSES = ("queued", "running", "stopping")
+ACTIVE_DUEL_STATUSES = ("queued", "running", "awaiting_decision")
+ACTIVE_CROSS_REVIEW_STATUSES = ("queued", "running", "awaiting_decision")
 
 
 class RunLockedError(RuntimeError):
@@ -543,6 +603,405 @@ class Store:
                 "stopped_at": datetime.fromisoformat(row["stopped_at"]) if row["stopped_at"] else None,
             }
         )
+
+    def create_duel(self, project: str, prompt: str, providers: list[AgentProvider]) -> DuelRecord:
+        now = datetime.now(UTC)
+        duel = DuelRecord(
+            id=str(uuid.uuid4()),
+            project=project,
+            prompt=prompt,
+            providers=providers,
+            status="queued",
+            created_at=now,
+            updated_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO duels
+                (id,project,prompt,providers,status,summary,report_path,created_at,updated_at)
+                VALUES (?, ?, ?, ?, ?, '', '', ?, ?)""",
+                (
+                    duel.id,
+                    duel.project,
+                    duel.prompt,
+                    json.dumps(duel.providers),
+                    duel.status,
+                    duel.created_at.isoformat(),
+                    duel.updated_at.isoformat(),
+                ),
+            )
+        return duel
+
+    def update_duel(
+        self,
+        duel_id: str,
+        status: DuelStatus,
+        summary: str = "",
+        *,
+        report_path: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE duels SET status=?, summary=?, report_path=COALESCE(?, report_path),
+                   updated_at=? WHERE id=?""",
+                (status, summary, report_path, datetime.now(UTC).isoformat(), duel_id),
+            )
+
+    def get_duel(self, duel_id: str) -> DuelRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM duels WHERE id = ?", (duel_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Duel not found: {duel_id}")
+        return self._duel_from_row(row)
+
+    def list_duels(self, active_only: bool = False, limit: int = 100) -> list[DuelRecord]:
+        query = "SELECT * FROM duels"
+        params: tuple = ()
+        if active_only:
+            query += f" WHERE status IN ({','.join('?' for _ in ACTIVE_DUEL_STATUSES)})"
+            params = ACTIVE_DUEL_STATUSES
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params = (*params, limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._duel_from_row(row) for row in rows]
+
+    def upsert_duel_participant(
+        self,
+        duel_id: str,
+        provider: AgentProvider,
+        status: DuelParticipantStatus,
+        *,
+        session_id: str | None = None,
+        workspace: str = "",
+        changed_files: list[str] | None = None,
+        diff_stat: str = "",
+        validation_ok: bool | None = None,
+        validation_summary: str = "",
+        runtime_seconds: float = 0.0,
+        summary: str = "",
+        open_risks: list[str] | None = None,
+        artifact_path: str = "",
+    ) -> DuelParticipantRecord:
+        now = datetime.now(UTC)
+        existing = self.get_duel_participant(duel_id, provider, required=False)
+        created_at = existing.created_at if existing else now
+        record = DuelParticipantRecord(
+            duel_id=duel_id,
+            provider=provider,
+            session_id=session_id if session_id is not None else (existing.session_id if existing else None),
+            status=status,
+            workspace=workspace or (existing.workspace if existing else ""),
+            changed_files=changed_files if changed_files is not None else (existing.changed_files if existing else []),
+            diff_stat=diff_stat or (existing.diff_stat if existing else ""),
+            validation_ok=validation_ok if validation_ok is not None else (existing.validation_ok if existing else None),
+            validation_summary=validation_summary or (existing.validation_summary if existing else ""),
+            runtime_seconds=runtime_seconds or (existing.runtime_seconds if existing else 0.0),
+            summary=summary or (existing.summary if existing else ""),
+            open_risks=open_risks if open_risks is not None else (existing.open_risks if existing else []),
+            artifact_path=artifact_path or (existing.artifact_path if existing else ""),
+            created_at=created_at,
+            updated_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO duel_participants
+                (duel_id,provider,session_id,status,workspace,changed_files,diff_stat,validation_ok,
+                 validation_summary,runtime_seconds,summary,open_risks,artifact_path,created_at,updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(duel_id, provider) DO UPDATE SET
+                  session_id=excluded.session_id, status=excluded.status, workspace=excluded.workspace,
+                  changed_files=excluded.changed_files, diff_stat=excluded.diff_stat,
+                  validation_ok=excluded.validation_ok, validation_summary=excluded.validation_summary,
+                  runtime_seconds=excluded.runtime_seconds, summary=excluded.summary,
+                  open_risks=excluded.open_risks, artifact_path=excluded.artifact_path,
+                  updated_at=excluded.updated_at""",
+                (
+                    record.duel_id,
+                    record.provider,
+                    record.session_id,
+                    record.status,
+                    record.workspace,
+                    json.dumps(record.changed_files),
+                    record.diff_stat,
+                    None if record.validation_ok is None else int(record.validation_ok),
+                    record.validation_summary,
+                    record.runtime_seconds,
+                    record.summary,
+                    json.dumps(record.open_risks),
+                    record.artifact_path,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+        return record
+
+    def get_duel_participant(
+        self,
+        duel_id: str,
+        provider: AgentProvider,
+        *,
+        required: bool = True,
+    ) -> DuelParticipantRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM duel_participants WHERE duel_id = ? AND provider = ?",
+                (duel_id, provider),
+            ).fetchone()
+        if row is None:
+            if required:
+                raise KeyError(f"Duel participant not found: {duel_id}/{provider}")
+            return None
+        return self._duel_participant_from_row(row)
+
+    def list_duel_participants(self, duel_id: str) -> list[DuelParticipantRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM duel_participants WHERE duel_id = ? ORDER BY created_at ASC",
+                (duel_id,),
+            ).fetchall()
+        return [self._duel_participant_from_row(row) for row in rows]
+
+    def _duel_from_row(self, row: sqlite3.Row) -> DuelRecord:
+        return DuelRecord.model_validate({**dict(row), "providers": json.loads(row["providers"])})
+
+    def _duel_participant_from_row(self, row: sqlite3.Row) -> DuelParticipantRecord:
+        validation_ok = row["validation_ok"]
+        return DuelParticipantRecord.model_validate(
+            {
+                **dict(row),
+                "changed_files": json.loads(row["changed_files"]),
+                "open_risks": json.loads(row["open_risks"]),
+                "validation_ok": None if validation_ok is None else bool(validation_ok),
+            }
+        )
+
+    def create_adoption_decision(
+        self,
+        *,
+        target_type: AdoptionTargetType,
+        target_id: str,
+        project: str,
+        source_workspace: str,
+        destination_workspace: str,
+        status: AdoptionStatus,
+        provider: AgentProvider | None = None,
+        session_id: str | None = None,
+        changed_files: list[str] | None = None,
+        summary: str = "",
+        error: str = "",
+    ) -> AdoptionRecord:
+        record = AdoptionRecord(
+            id=str(uuid.uuid4()),
+            target_type=target_type,
+            target_id=target_id,
+            provider=provider,
+            session_id=session_id,
+            project=project,
+            source_workspace=source_workspace,
+            destination_workspace=destination_workspace,
+            status=status,
+            changed_files=changed_files or [],
+            summary=summary,
+            error=error,
+            created_at=datetime.now(UTC),
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO adoption_decisions
+                (id,target_type,target_id,provider,session_id,project,source_workspace,destination_workspace,
+                 status,changed_files,summary,error,created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.id,
+                    record.target_type,
+                    record.target_id,
+                    record.provider,
+                    record.session_id,
+                    record.project,
+                    record.source_workspace,
+                    record.destination_workspace,
+                    record.status,
+                    json.dumps(record.changed_files),
+                    record.summary,
+                    record.error,
+                    record.created_at.isoformat(),
+                ),
+            )
+        return record
+
+    def get_adoption_decision(self, decision_id: str) -> AdoptionRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM adoption_decisions WHERE id = ?", (decision_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Adoption decision not found: {decision_id}")
+        return self._adoption_from_row(row)
+
+    def list_adoption_decisions(self, limit: int = 100) -> list[AdoptionRecord]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM adoption_decisions ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [self._adoption_from_row(row) for row in rows]
+
+    def _adoption_from_row(self, row: sqlite3.Row) -> AdoptionRecord:
+        return AdoptionRecord.model_validate({**dict(row), "changed_files": json.loads(row["changed_files"])})
+
+    def create_cross_review(self, duel_id: str) -> CrossReviewRecord:
+        self.get_duel(duel_id)
+        now = datetime.now(UTC)
+        record = CrossReviewRecord(
+            id=str(uuid.uuid4()),
+            duel_id=duel_id,
+            status="queued",
+            created_at=now,
+            updated_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO cross_reviews
+                (id,duel_id,status,summary,report_path,created_at,updated_at)
+                VALUES (?, ?, ?, '', '', ?, ?)""",
+                (record.id, record.duel_id, record.status, record.created_at.isoformat(), record.updated_at.isoformat()),
+            )
+        return record
+
+    def update_cross_review(
+        self,
+        cross_review_id: str,
+        status: CrossReviewStatus,
+        summary: str = "",
+        *,
+        report_path: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE cross_reviews SET status=?, summary=?, report_path=COALESCE(?, report_path),
+                   updated_at=? WHERE id=?""",
+                (status, summary, report_path, datetime.now(UTC).isoformat(), cross_review_id),
+            )
+
+    def get_cross_review(self, cross_review_id: str) -> CrossReviewRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cross_reviews WHERE id = ?", (cross_review_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Cross-review not found: {cross_review_id}")
+        return CrossReviewRecord.model_validate(dict(row))
+
+    def list_cross_reviews(
+        self,
+        *,
+        duel_id: str | None = None,
+        active_only: bool = False,
+        limit: int = 100,
+    ) -> list[CrossReviewRecord]:
+        query = "SELECT * FROM cross_reviews"
+        params: tuple = ()
+        clauses: list[str] = []
+        if duel_id:
+            clauses.append("duel_id = ?")
+            params = (*params, duel_id)
+        if active_only:
+            clauses.append(f"status IN ({','.join('?' for _ in ACTIVE_CROSS_REVIEW_STATUSES)})")
+            params = (*params, *ACTIVE_CROSS_REVIEW_STATUSES)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params = (*params, limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [CrossReviewRecord.model_validate(dict(row)) for row in rows]
+
+    def upsert_cross_review_critique(
+        self,
+        cross_review_id: str,
+        duel_id: str,
+        reviewer_provider: AgentProvider,
+        subject_provider: AgentProvider,
+        status: CrossReviewCritiqueStatus,
+        *,
+        session_id: str | None = None,
+        summary: str = "",
+        findings: list[str] | None = None,
+        artifact_path: str = "",
+    ) -> CrossReviewCritiqueRecord:
+        now = datetime.now(UTC)
+        existing = self.get_cross_review_critique(
+            cross_review_id,
+            reviewer_provider,
+            subject_provider,
+            required=False,
+        )
+        created_at = existing.created_at if existing else now
+        record = CrossReviewCritiqueRecord(
+            cross_review_id=cross_review_id,
+            duel_id=duel_id,
+            reviewer_provider=reviewer_provider,
+            subject_provider=subject_provider,
+            session_id=session_id if session_id is not None else (existing.session_id if existing else None),
+            status=status,
+            summary=summary or (existing.summary if existing else ""),
+            findings=findings if findings is not None else (existing.findings if existing else []),
+            artifact_path=artifact_path or (existing.artifact_path if existing else ""),
+            created_at=created_at,
+            updated_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO cross_review_critiques
+                (cross_review_id,duel_id,reviewer_provider,subject_provider,session_id,status,summary,
+                 findings,artifact_path,created_at,updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cross_review_id, reviewer_provider, subject_provider) DO UPDATE SET
+                  session_id=excluded.session_id, status=excluded.status, summary=excluded.summary,
+                  findings=excluded.findings, artifact_path=excluded.artifact_path,
+                  updated_at=excluded.updated_at""",
+                (
+                    record.cross_review_id,
+                    record.duel_id,
+                    record.reviewer_provider,
+                    record.subject_provider,
+                    record.session_id,
+                    record.status,
+                    record.summary,
+                    json.dumps(record.findings),
+                    record.artifact_path,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+        return record
+
+    def get_cross_review_critique(
+        self,
+        cross_review_id: str,
+        reviewer_provider: AgentProvider,
+        subject_provider: AgentProvider,
+        *,
+        required: bool = True,
+    ) -> CrossReviewCritiqueRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM cross_review_critiques
+                   WHERE cross_review_id=? AND reviewer_provider=? AND subject_provider=?""",
+                (cross_review_id, reviewer_provider, subject_provider),
+            ).fetchone()
+        if row is None:
+            if required:
+                raise KeyError(
+                    f"Cross-review critique not found: {cross_review_id}/{reviewer_provider}/{subject_provider}"
+                )
+            return None
+        return self._cross_review_critique_from_row(row)
+
+    def list_cross_review_critiques(self, cross_review_id: str) -> list[CrossReviewCritiqueRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cross_review_critiques WHERE cross_review_id=? ORDER BY created_at ASC",
+                (cross_review_id,),
+            ).fetchall()
+        return [self._cross_review_critique_from_row(row) for row in rows]
+
+    def _cross_review_critique_from_row(self, row: sqlite3.Row) -> CrossReviewCritiqueRecord:
+        return CrossReviewCritiqueRecord.model_validate({**dict(row), "findings": json.loads(row["findings"])})
 
     def create_agent_session(
         self,

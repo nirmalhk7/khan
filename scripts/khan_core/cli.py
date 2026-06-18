@@ -8,12 +8,16 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .adoption import AdoptionError, AdoptionManager
 from .agent_adapters import agent_adapter_names
 from .agents import AgentSessionError, AgentSessionRunner
+from .ask import AskError, AskRunner
 from .attention import AttentionRouter
 from .config import discover_project, load_config, save_config, write_default_config
+from .cross_review import CrossReviewError, CrossReviewRunner
 from .daemon import DaemonSupervisor, DaemonSupervisorError
 from .doctor import run_doctor
+from .duel import DuelError, DuelRunner
 from .loop_engine import LoopEngine
 from .models import AgentProvider, TaskCapsule
 from .queue_worker import QueueWorker
@@ -29,12 +33,19 @@ run_app = typer.Typer(no_args_is_help=True, help="Inspect and control task-loop 
 session_app = typer.Typer(no_args_is_help=True, help="Start and inspect provider-neutral agent sessions.")
 queue_app = typer.Typer(no_args_is_help=True, help="Manage Khan's durable work queue.")
 daemon_app = typer.Typer(no_args_is_help=True, help="Manage Khan's detached daemon supervisor.")
+duel_app = typer.Typer(
+    no_args_is_help=True,
+    help='Run and inspect provider duels. Use `khan duel run . "prompt"` for local path targets.',
+)
+adoption_app = typer.Typer(no_args_is_help=True, help="Inspect adoption and rejection decisions.")
 app.add_typer(project_app, name="project")
 app.add_typer(task_app, name="task")
 app.add_typer(run_app, name="run")
 app.add_typer(session_app, name="session")
 app.add_typer(queue_app, name="queue")
 app.add_typer(daemon_app, name="daemon")
+app.add_typer(duel_app, name="duel")
+app.add_typer(adoption_app, name="adoption")
 
 console = Console()
 
@@ -58,6 +69,41 @@ def doctor() -> None:
     for key, value in run_doctor(config):
         table.add_row(key, value)
     console.print(table)
+
+
+@app.command()
+def ask(
+    target: str,
+    prompt: str,
+    title: str | None = typer.Option(None, "--title", help="Task title; defaults to the prompt prefix."),
+    success: str | None = typer.Option(None, "--success", help="Success criterion for the generated task."),
+    profile: str | None = typer.Option(None, "--profile", help="Loop profile to use."),
+    accept: list[str] | None = typer.Option(None, "--accept", help="Acceptance criterion; repeatable."),
+    verify: list[str] | None = typer.Option(None, "--verify", help="Verification command; repeatable."),
+    enqueue: bool = typer.Option(False, "--enqueue", help="Create and queue the task instead of running immediately."),
+    priority: int = typer.Option(100, "--priority", help="Queue priority when using --enqueue."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Create and run a zero-friction local task from a broad prompt."""
+    try:
+        task, run, item = AskRunner(config).ask(
+            target,
+            prompt,
+            title=title,
+            success=success,
+            profile=profile,
+            accept=accept,
+            verify=verify,
+            enqueue=enqueue,
+            priority=priority,
+        )
+    except AskError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if item:
+        console.print(f"Created task {task.id} and queued item {item.id}")
+        return
+    assert run is not None
+    console.print(f"Created task {task.id}; run {run.id} finished with status {run.status}")
 
 
 @project_app.command("add")
@@ -312,6 +358,264 @@ def session_cancel(session_id: str) -> None:
     console.print(f"Cancel requested for session {session_id}")
 
 
+def _run_duel(target: str, prompt: str, provider: list[str] | None, config: Path | None, validate: bool) -> None:
+    try:
+        duel = DuelRunner(config).run_duel(target, prompt, providers=provider or None, validate=validate)
+    except DuelError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Duel {duel.id} finished with status {duel.status}")
+    if duel.report_path:
+        console.print(f"Report: {duel.report_path}")
+
+
+@duel_app.command("run")
+def duel_run(
+    target: str,
+    prompt: str,
+    provider: list[str] | None = typer.Option(None, "--provider", help="Provider to include; repeatable."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+    validate: bool = typer.Option(True, "--validate/--no-validate", help="Run project validation for each candidate."),
+) -> None:
+    """Run Codex and Cursor Agent against the same task in isolated worktrees."""
+    _run_duel(target, prompt, provider, config, validate)
+
+
+@duel_app.command("list")
+def duel_list(
+    active: bool = typer.Option(False, "--active"),
+    limit: int = typer.Option(50, "--limit"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """List provider duel records."""
+    loaded = load_config(config)
+    store = Store(loaded.global_config.state_dir)
+    table = Table(title="Duels")
+    table.add_column("Duel")
+    table.add_column("Project")
+    table.add_column("Status")
+    table.add_column("Providers")
+    table.add_column("Summary")
+    for duel_record in store.list_duels(active_only=active, limit=limit):
+        table.add_row(
+            duel_record.id[:8],
+            duel_record.project,
+            duel_record.status,
+            ", ".join(duel_record.providers),
+            duel_record.summary or "-",
+        )
+    console.print(table)
+
+
+@duel_app.command("show")
+def duel_show(
+    duel_id: str,
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a table."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show a duel and its provider participants."""
+    loaded = load_config(config)
+    store = Store(loaded.global_config.state_dir)
+    duel_record = store.get_duel(duel_id)
+    participants = store.list_duel_participants(duel_id)
+    if json_output:
+        console.print_json(
+            json.dumps(
+                {
+                    "duel": duel_record.model_dump(mode="json"),
+                    "participants": [participant.model_dump(mode="json") for participant in participants],
+                }
+            )
+        )
+        return
+    console.print(f"[bold]Duel[/bold] {duel_record.id}  [bold]Status[/bold] {duel_record.status}")
+    console.print(duel_record.summary or "-")
+    if duel_record.report_path:
+        console.print(f"Report: {duel_record.report_path}")
+    table = Table(title="Participants")
+    table.add_column("Provider")
+    table.add_column("Status")
+    table.add_column("Session")
+    table.add_column("Validation")
+    table.add_column("Files")
+    table.add_column("Runtime")
+    table.add_column("Artifact")
+    for participant in participants:
+        validation = (
+            "skipped" if participant.validation_ok is None else "pass" if participant.validation_ok else "fail"
+        )
+        table.add_row(
+            participant.provider,
+            participant.status,
+            participant.session_id[:8] if participant.session_id else "-",
+            validation,
+            str(len(participant.changed_files)),
+            f"{participant.runtime_seconds:.2f}s",
+            participant.artifact_path or "-",
+        )
+    console.print(table)
+
+
+@duel_app.command("artifacts")
+def duel_artifacts(
+    duel_id: str,
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """List artifacts captured for a provider duel."""
+    loaded = load_config(config)
+    for path in Store(loaded.global_config.state_dir).list_artifacts(duel_id):
+        console.print(str(path))
+
+
+@app.command()
+def adopt(
+    target_id: str,
+    provider: str | None = typer.Option(None, "--provider", help="Provider when adopting a duel participant."),
+    force: bool = typer.Option(False, "--force", help="Allow adoption into a dirty destination worktree."),
+    cleanup: bool = typer.Option(False, "--cleanup", help="Remove the source worktree after adoption."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Adopt changes from a run, session, or duel participant into the project checkout."""
+    try:
+        decision = AdoptionManager(config).adopt(target_id, provider=provider, force=force, cleanup=cleanup)
+    except AdoptionError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Adopted {decision.target_type} {decision.target_id} as decision {decision.id}")
+    console.print(decision.summary)
+
+
+@app.command()
+def reject(
+    target_id: str,
+    provider: str | None = typer.Option(None, "--provider", help="Provider when rejecting a duel participant."),
+    cleanup: bool = typer.Option(True, "--cleanup/--keep-worktree", help="Remove the source worktree after rejection."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Reject changes from a run, session, or duel participant."""
+    try:
+        decision = AdoptionManager(config).reject(target_id, provider=provider, cleanup=cleanup)
+    except AdoptionError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Rejected {decision.target_type} {decision.target_id} as decision {decision.id}")
+    console.print(decision.summary)
+
+
+@adoption_app.command("list")
+def adoption_list(
+    limit: int = typer.Option(50, "--limit"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """List adoption and rejection decisions."""
+    loaded = load_config(config)
+    table = Table(title="Adoption Decisions")
+    table.add_column("Decision")
+    table.add_column("Status")
+    table.add_column("Target")
+    table.add_column("Provider")
+    table.add_column("Project")
+    table.add_column("Files")
+    table.add_column("Summary")
+    for decision in Store(loaded.global_config.state_dir).list_adoption_decisions(limit=limit):
+        table.add_row(
+            decision.id[:8],
+            decision.status,
+            f"{decision.target_type}:{decision.target_id[:8]}",
+            decision.provider or "-",
+            decision.project,
+            str(len(decision.changed_files)),
+            decision.error or decision.summary or "-",
+        )
+    console.print(table)
+
+
+@app.command("cross-review")
+def cross_review(
+    duel_id: str,
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Run provider cross-review for a completed duel."""
+    try:
+        record = CrossReviewRunner(config).run_cross_review(duel_id)
+    except CrossReviewError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Cross-review {record.id} finished with status {record.status}")
+    if record.report_path:
+        console.print(f"Report: {record.report_path}")
+
+
+@app.command("cross-review-list")
+def cross_review_list(
+    duel_id: str | None = typer.Option(None, "--duel-id", help="Filter by duel ID."),
+    active: bool = typer.Option(False, "--active"),
+    limit: int = typer.Option(50, "--limit"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """List cross-review records."""
+    loaded = load_config(config)
+    table = Table(title="Cross-Reviews")
+    table.add_column("CrossReview")
+    table.add_column("Duel")
+    table.add_column("Status")
+    table.add_column("Summary")
+    for record in Store(loaded.global_config.state_dir).list_cross_reviews(duel_id=duel_id, active_only=active, limit=limit):
+        table.add_row(record.id[:8], record.duel_id[:8], record.status, record.summary or "-")
+    console.print(table)
+
+
+@app.command("cross-review-show")
+def cross_review_show(
+    cross_review_id: str,
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a table."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show a cross-review and its critiques."""
+    loaded = load_config(config)
+    store = Store(loaded.global_config.state_dir)
+    record = store.get_cross_review(cross_review_id)
+    critiques = store.list_cross_review_critiques(cross_review_id)
+    if json_output:
+        console.print_json(
+            json.dumps(
+                {
+                    "cross_review": record.model_dump(mode="json"),
+                    "critiques": [critique.model_dump(mode="json") for critique in critiques],
+                }
+            )
+        )
+        return
+    console.print(f"[bold]Cross-review[/bold] {record.id}  [bold]Status[/bold] {record.status}")
+    console.print(record.summary or "-")
+    if record.report_path:
+        console.print(f"Report: {record.report_path}")
+    table = Table(title="Critiques")
+    table.add_column("Reviewer")
+    table.add_column("Subject")
+    table.add_column("Status")
+    table.add_column("Session")
+    table.add_column("Findings")
+    table.add_column("Artifact")
+    for critique in critiques:
+        table.add_row(
+            critique.reviewer_provider,
+            critique.subject_provider,
+            critique.status,
+            critique.session_id[:8] if critique.session_id else "-",
+            str(len(critique.findings)),
+            critique.artifact_path or "-",
+        )
+    console.print(table)
+
+
+@app.command("cross-review-artifacts")
+def cross_review_artifacts(
+    cross_review_id: str,
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """List artifacts captured for a cross-review."""
+    loaded = load_config(config)
+    for path in Store(loaded.global_config.state_dir).list_artifacts(cross_review_id):
+        console.print(str(path))
+
+
 @app.command()
 def review(run_id: str) -> None:
     """Run Codex review on the workspace for an existing run."""
@@ -322,7 +626,7 @@ def review(run_id: str) -> None:
 
 @app.command()
 def attention() -> None:
-    """Show runs, sessions, and queue items ordered by operator attention priority."""
+    """Show runs, sessions, queue items, daemons, duels, and cross-reviews ordered by priority."""
     config = load_config()
     router = AttentionRouter(Store(config.global_config.state_dir))
     table = Table(title="Attention")

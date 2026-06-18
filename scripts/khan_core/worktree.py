@@ -17,9 +17,11 @@ class WorktreeManager:
         self.state_dir = state_dir
 
     def choose_workspace(self, project: ProjectConfig, run_id: str, force_worktree: bool) -> tuple[Path, bool]:
+        if force_worktree:
+            return self.create_worktree(project, run_id), True
         if project.workspace_mode == "in_place":
             return project.path, False
-        if project.workspace_mode in {"auto", "worktree"} or force_worktree:
+        if project.workspace_mode in {"auto", "worktree"}:
             return self.create_worktree(project, run_id), True
         raise ValueError(f"Unsupported workspace mode: {project.workspace_mode}")
 

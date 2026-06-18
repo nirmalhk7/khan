@@ -20,6 +20,12 @@ AgentSessionStatus = Literal[
 QueueItemKind = Literal["task", "session"]
 QueueItemStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
 DaemonStatus = Literal["running", "stopping", "stopped", "failed"]
+DuelStatus = Literal["queued", "running", "awaiting_decision", "adopted", "rejected", "failed", "cancelled"]
+DuelParticipantStatus = Literal["queued", "running", "succeeded", "adopted", "rejected", "failed", "cancelled"]
+AdoptionTargetType = Literal["duel", "session", "run"]
+AdoptionStatus = Literal["adopted", "rejected", "failed"]
+CrossReviewStatus = Literal["queued", "running", "awaiting_decision", "failed"]
+CrossReviewCritiqueStatus = Literal["queued", "running", "succeeded", "failed"]
 
 RunStatus = Literal[
     "queued",
@@ -185,6 +191,76 @@ class DaemonRecord(BaseModel):
     error: str = ""
 
 
+class DuelRecord(BaseModel):
+    id: str
+    project: str
+    prompt: str
+    providers: list[AgentProvider] = Field(default_factory=list)
+    status: DuelStatus
+    summary: str = ""
+    report_path: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class DuelParticipantRecord(BaseModel):
+    duel_id: str
+    provider: AgentProvider
+    session_id: str | None = None
+    status: DuelParticipantStatus
+    workspace: str = ""
+    changed_files: list[str] = Field(default_factory=list)
+    diff_stat: str = ""
+    validation_ok: bool | None = None
+    validation_summary: str = ""
+    runtime_seconds: float = 0.0
+    summary: str = ""
+    open_risks: list[str] = Field(default_factory=list)
+    artifact_path: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdoptionRecord(BaseModel):
+    id: str
+    target_type: AdoptionTargetType
+    target_id: str
+    provider: AgentProvider | None = None
+    session_id: str | None = None
+    project: str
+    source_workspace: str
+    destination_workspace: str
+    status: AdoptionStatus
+    changed_files: list[str] = Field(default_factory=list)
+    summary: str = ""
+    error: str = ""
+    created_at: datetime
+
+
+class CrossReviewRecord(BaseModel):
+    id: str
+    duel_id: str
+    status: CrossReviewStatus
+    summary: str = ""
+    report_path: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class CrossReviewCritiqueRecord(BaseModel):
+    cross_review_id: str
+    duel_id: str
+    reviewer_provider: AgentProvider
+    subject_provider: AgentProvider
+    session_id: str | None = None
+    status: CrossReviewCritiqueStatus
+    summary: str = ""
+    findings: list[str] = Field(default_factory=list)
+    artifact_path: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
 class WorkerResult(BaseModel):
     status: Literal["done", "blocked", "needs_review", "needs_human"]
     summary: str
@@ -240,7 +316,7 @@ class TaskCapsule(BaseModel):
 
 class DecisionCard(BaseModel):
     run_id: str
-    subject_type: Literal["run", "session", "queue", "daemon"] = "run"
+    subject_type: Literal["run", "session", "queue", "daemon", "duel", "cross_review"] = "run"
     classification: Literal["healthy", "watch", "decision_required", "stopped"]
     score: int
     summary: str

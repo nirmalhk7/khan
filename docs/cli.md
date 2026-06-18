@@ -12,6 +12,25 @@ khan doctor
 `init` writes the default config and initializes the SQLite store. `doctor`
 checks configured binaries, git, the state directory, and registered projects.
 
+## Ask
+
+```bash
+khan ask <project-or-path> "Implement this task."
+khan ask . "Implement this task." --enqueue
+khan ask . "Implement this task." --verify "make test" --accept "Tests pass."
+```
+
+`ask` is the shortest path from a broad local prompt to a durable Khan task. The
+target can be a configured project name or any path inside a local git
+repository. If the path is not already configured, Khan discovers the git root,
+creates a local project entry, infers validation commands, and persists the
+generated task capsule.
+
+By default, `ask` runs the task immediately through the Codex task loop. Use
+`--enqueue` to create the task and queue item without running it in the current
+terminal. Use `--title`, `--success`, `--accept`, `--verify`, and `--profile`
+when the broad prompt needs more explicit constraints.
+
 ## Projects
 
 ```bash
@@ -112,6 +131,65 @@ Session status values include:
 - `failed`
 - `cancelled`
 
+## Provider Duels
+
+```bash
+khan duel run <project-or-path> "Implement this task."
+khan duel run <project-or-path> "Implement this task." --provider codex --provider cursor-agent
+khan duel list
+khan duel show <duel-id>
+khan duel show <duel-id> --json
+khan duel artifacts <duel-id>
+```
+
+`duel run` runs each selected provider against the same prompt in an isolated
+git worktree, records one parent duel plus one participant per provider,
+validates each workspace with the project's configured validation commands, and
+writes a `duel-report.md` artifact.
+
+The target can be a configured project name or a local git path. Path targets
+are auto-discovered and added to config so broad local work does not require a
+separate `project add` step.
+
+Use `--config <path>` on duel commands when operating a non-default state store.
+
+## Cross-Review
+
+```bash
+khan cross-review <duel-id>
+khan cross-review-list
+khan cross-review-list --duel-id <duel-id>
+khan cross-review-show <cross-review-id>
+khan cross-review-show <cross-review-id> --json
+khan cross-review-artifacts <cross-review-id>
+```
+
+`cross-review` runs each completed duel provider against the other provider's
+diff using the same project review prompt. It records one parent cross-review,
+one critique per reviewer/subject pair, Markdown artifacts for each critique,
+and a `cross-review-report.md` decision artifact.
+
+## Adoption Decisions
+
+```bash
+khan adopt <run-id>
+khan adopt <session-id>
+khan adopt <duel-id> --provider codex
+khan reject <duel-id> --provider cursor-agent
+khan reject <session-id> --keep-worktree
+khan adoption list
+```
+
+`adopt` copies changes from the recorded source workspace into the configured
+project checkout. It refuses to write into a dirty destination worktree unless
+`--force` is supplied. Use `--cleanup` to remove the source worktree after a
+successful adoption.
+
+`reject` records a rejection and removes the source worktree by default. Use
+`--keep-worktree` to preserve it for manual inspection. Every adopt/reject
+operation is recorded in SQLite and visible through `adoption list` and
+`metrics`.
+
 ## Queue And Daemon
 
 ```bash
@@ -151,6 +229,7 @@ The TUI currently shows registered projects, recent task runs, recent agent
 sessions, and active work. It is a scaffold for the operator console and does
 not yet expose all CLI actions.
 
-`attention` shows runs, sessions, and queue items sorted by operator priority.
-`metrics` prints JSON counts for run statuses, session statuses, queue statuses,
-and attention classes.
+`attention` shows runs, sessions, queue items, daemons, duels, and cross-reviews sorted by
+operator priority. `metrics` prints JSON counts for run statuses, session
+statuses, queue statuses, daemon statuses, duel statuses, cross-review statuses,
+adoption decisions, and attention classes.

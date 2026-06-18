@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from .models import AgentSessionRecord, DaemonRecord, DecisionCard, QueueItemRecord, RunRecord
+from .models import AgentSessionRecord, CrossReviewRecord, DaemonRecord, DecisionCard, DuelRecord, QueueItemRecord, RunRecord
 from .store import Store
 
 
@@ -21,6 +21,10 @@ class AttentionRouter:
             cards.append(self._queue_card(item))
         for daemon in self.store.list_daemons(limit=20):
             cards.append(self._daemon_card(daemon))
+        for duel in self.store.list_duels(limit=50):
+            cards.append(self._duel_card(duel))
+        for cross_review in self.store.list_cross_reviews(limit=50):
+            cards.append(self._cross_review_card(cross_review))
         return sorted(cards, key=lambda card: card.score, reverse=True)
 
     def metrics(self) -> dict[str, Any]:
@@ -32,6 +36,12 @@ class AttentionRouter:
         queue_statuses = Counter(item.status for item in queue_items)
         daemons = self.store.list_daemons(limit=100)
         daemon_statuses = Counter(daemon.status for daemon in daemons)
+        duels = self.store.list_duels(limit=100)
+        duel_statuses = Counter(duel.status for duel in duels)
+        adoptions = self.store.list_adoption_decisions(limit=500)
+        adoption_statuses = Counter(adoption.status for adoption in adoptions)
+        cross_reviews = self.store.list_cross_reviews(limit=100)
+        cross_review_statuses = Counter(cross_review.status for cross_review in cross_reviews)
         decision_cards = self.cards()
         return {
             "runs": {
@@ -65,6 +75,25 @@ class AttentionRouter:
                 "status_counts": dict(sorted(daemon_statuses.items())),
                 "running": daemon_statuses.get("running", 0),
                 "failed": daemon_statuses.get("failed", 0),
+            },
+            "duels": {
+                "total": len(duels),
+                "status_counts": dict(sorted(duel_statuses.items())),
+                "awaiting_decision": duel_statuses.get("awaiting_decision", 0),
+                "failed": duel_statuses.get("failed", 0),
+            },
+            "adoptions": {
+                "total": len(adoptions),
+                "status_counts": dict(sorted(adoption_statuses.items())),
+                "adopted": adoption_statuses.get("adopted", 0),
+                "rejected": adoption_statuses.get("rejected", 0),
+                "failed": adoption_statuses.get("failed", 0),
+            },
+            "cross_reviews": {
+                "total": len(cross_reviews),
+                "status_counts": dict(sorted(cross_review_statuses.items())),
+                "awaiting_decision": cross_review_statuses.get("awaiting_decision", 0),
+                "failed": cross_review_statuses.get("failed", 0),
             },
         }
 
@@ -204,4 +233,92 @@ class AttentionRouter:
             summary=f"Daemon {daemon.id[:8]} is {daemon.status}.",
             evidence=[f"pid={daemon.pid}", f"status={daemon.status}"],
             recommended_actions=["khan daemon status"],
+        )
+
+    def _duel_card(self, duel: DuelRecord) -> DecisionCard:
+        if duel.status == "awaiting_decision":
+            return DecisionCard(
+                run_id=duel.id,
+                subject_type="duel",
+                classification="decision_required",
+                score=88,
+                summary=duel.summary or f"Duel {duel.id[:8]} is ready for provider selection.",
+                evidence=[f"project={duel.project}", f"providers={', '.join(duel.providers)}"],
+                recommended_actions=[f"khan duel show {duel.id}", f"khan duel artifacts {duel.id}"],
+            )
+        if duel.status == "running":
+            return DecisionCard(
+                run_id=duel.id,
+                subject_type="duel",
+                classification="watch",
+                score=55,
+                summary=duel.summary or f"Duel {duel.id[:8]} is running.",
+                evidence=[f"project={duel.project}", f"providers={', '.join(duel.providers)}"],
+                recommended_actions=[f"khan duel show {duel.id}"],
+            )
+        if duel.status == "failed":
+            return DecisionCard(
+                run_id=duel.id,
+                subject_type="duel",
+                classification="stopped",
+                score=75,
+                summary=duel.summary or f"Duel {duel.id[:8]} failed.",
+                evidence=[f"project={duel.project}", f"providers={', '.join(duel.providers)}"],
+                recommended_actions=[f"khan duel show {duel.id}", f"khan duel artifacts {duel.id}"],
+            )
+        return DecisionCard(
+            run_id=duel.id,
+            subject_type="duel",
+            classification="healthy",
+            score=1,
+            summary=duel.summary or f"Duel {duel.id[:8]} is {duel.status}.",
+            evidence=[f"project={duel.project}", f"status={duel.status}"],
+            recommended_actions=[f"khan duel show {duel.id}"],
+        )
+
+    def _cross_review_card(self, cross_review: CrossReviewRecord) -> DecisionCard:
+        if cross_review.status == "awaiting_decision":
+            return DecisionCard(
+                run_id=cross_review.id,
+                subject_type="cross_review",
+                classification="decision_required",
+                score=90,
+                summary=cross_review.summary or f"Cross-review {cross_review.id[:8]} is ready.",
+                evidence=[f"duel={cross_review.duel_id}"],
+                recommended_actions=[
+                    f"khan cross-review-show {cross_review.id}",
+                    f"khan cross-review-artifacts {cross_review.id}",
+                ],
+            )
+        if cross_review.status == "running":
+            return DecisionCard(
+                run_id=cross_review.id,
+                subject_type="cross_review",
+                classification="watch",
+                score=60,
+                summary=cross_review.summary or f"Cross-review {cross_review.id[:8]} is running.",
+                evidence=[f"duel={cross_review.duel_id}"],
+                recommended_actions=[f"khan cross-review-show {cross_review.id}"],
+            )
+        if cross_review.status == "failed":
+            return DecisionCard(
+                run_id=cross_review.id,
+                subject_type="cross_review",
+                classification="stopped",
+                score=78,
+                summary=cross_review.summary or f"Cross-review {cross_review.id[:8]} failed.",
+                evidence=[f"duel={cross_review.duel_id}"],
+                recommended_actions=[
+                    f"khan cross-review-show {cross_review.id}",
+                    f"khan cross-review-artifacts {cross_review.id}",
+                ],
+            )
+        return DecisionCard(
+            run_id=cross_review.id,
+            subject_type="cross_review",
+            classification="healthy",
+            score=1,
+            summary=cross_review.summary or f"Cross-review {cross_review.id[:8]} is {cross_review.status}.",
+            evidence=[f"duel={cross_review.duel_id}", f"status={cross_review.status}"],
+            recommended_actions=[f"khan cross-review-show {cross_review.id}"],
         )
