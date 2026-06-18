@@ -16,8 +16,8 @@ terminal session at a time.
 ## Status
 
 Khan is early FOSS infrastructure. It is usable as a local CLI today, but richer
-TUI, same-session steering, crash restart policy, and multi-agent topologies are
-still being built.
+TUI, same-session steering, replay/benchmark workflows, crash restart policy,
+and deeper multi-agent topologies are still being built.
 
 Currently implemented:
 
@@ -25,6 +25,8 @@ Currently implemented:
   artifacts, process heartbeats, pause/resume/cancel, and protected-path stops.
 - Persisted task capsules with acceptance criteria, allowed paths, protected
   paths, verification recipes, blast radius, dependencies, and conflict domains.
+- Zero-friction `khan ask <project-or-path> "prompt"` task intake with local git
+  project auto-discovery, validation inference, immediate run, and enqueue mode.
 - Conflict-domain scheduling guardrails for active runs.
 - Durable queue items for task runs and agent sessions, foreground workers,
   detached daemon start/status/stop, stale lease recovery, and last-item
@@ -32,6 +34,12 @@ Currently implemented:
 - Provider-neutral session registry for headless agents.
 - Built-in agent adapters for `codex` and `cursor-agent`.
 - Adapter registry for third-party agents.
+- Provider duel records that run Codex and Cursor Agent against the same prompt
+  in isolated worktrees, then write side-by-side evidence reports.
+- Cross-review records where each duel provider reviews the other provider's
+  diff through the same adapter/session layer.
+- Manual adopt/reject decisions for run, session, and duel workspaces with dirty
+  destination refusal, optional cleanup, and durable decision records.
 - Attention router and metrics commands for operator visibility.
 - Textual TUI scaffold showing projects, task runs, and agent sessions.
 - macOS `say` notification when a task run enters `needs_human`.
@@ -65,6 +73,13 @@ khan init
 khan doctor
 khan project add khan /Users/nirmalhk7/Documents/DevWorld/khan
 khan project list
+```
+
+Run a broad local task without pre-registering the repo:
+
+```bash
+khan ask . "Update the docs for the current orchestration features."
+khan ask . "Queue this for later validation." --enqueue
 ```
 
 Create a durable Codex task with a capsule:
@@ -106,6 +121,19 @@ khan session enqueue cursor-agent khan --prompt "Inspect this repo and summarize
 khan queue list
 khan session list
 khan session logs <session-id>
+```
+
+Run a provider duel and inspect the evidence:
+
+```bash
+khan duel run khan "Implement the feature in the safest way you can."
+khan duel show <duel-id>
+khan duel artifacts <duel-id>
+khan cross-review <duel-id>
+khan cross-review-show <cross-review-id>
+khan adopt <duel-id> --provider codex
+khan reject <duel-id> --provider cursor-agent
+khan adoption list
 ```
 
 Control task runs:
@@ -169,7 +197,7 @@ is available. Notification failures are recorded and do not fail the run.
 
 ## Architecture
 
-Khan has two execution concepts.
+Khan has three execution concepts.
 
 Task runs are durable Codex loops. A task has a title, objective, success
 criteria, profile, and persisted capsule. A run invokes Codex, captures JSONL
@@ -177,17 +205,37 @@ output, detects changed files from git, enforces capsule guardrails, runs
 validation commands, optionally runs Codex review, and either succeeds, retries,
 fails, or stops for human input.
 
+`khan ask` is the shortest path into that same machinery: it accepts a
+configured project name or local git path, creates a project config when needed,
+infers validation commands, writes a task capsule, and either runs immediately
+or queues the task.
+
 Agent sessions are provider-neutral one-shot headless executions. A session uses
 an adapter to build a command, parse stdout/stderr events, extract an external
 session ID where possible, and summarize final state. The same session store
 works for Codex, Cursor Agent, and custom adapters.
 
+Duels are parent orchestration records that launch multiple provider-neutral
+sessions against the same task in isolated git worktrees. Khan captures each
+participant's transcript, changed files, diff stat, validation result, runtime,
+summary, risks, and a generated `duel-report.md` for operator comparison.
+
+The current orchestration direction intentionally follows the practical shape of
+modern agent-first workflows: local control and extensibility inspired by Peter
+Steinberger's OpenClaw work, many observable concurrent sessions and loops
+popularized by Boris Cherny's Claude Code usage, and an agent cockpit where the
+human compares outputs instead of manually juggling terminal tabs.
+
 Important implementation areas:
 
 - CLI command surface.
+- Zero-friction ask intake for broad local tasks.
 - Codex task loop.
 - Provider-neutral session runner.
 - Agent adapter protocol and built-ins.
+- Provider duel runner and evidence reports.
+- Cross-review runner and critique artifacts.
+- Adopt/reject workflow for applying selected agent work.
 - Durable queue, foreground worker, and detached daemon supervisor.
 - Attention cards and metrics.
 - SQLite migrations and persistence.
@@ -217,6 +265,8 @@ process groups, cancellation, stdout/stderr event capture, and status updates.
 - The task loop still uses Codex as its worker/reviewer engine.
 - Agent sessions are headless one-shot sessions; same-session steering is not
   implemented yet.
+- Duels, cross-review, and manual adopt/reject are implemented, but replay and
+  benchmark workflows are still roadmap items.
 - The TUI is an operator-console scaffold, not a full interactive platform.
 - Detached daemon crash restart policy and daemon log tailing are not complete.
 - No Python packaging metadata yet.
@@ -244,3 +294,4 @@ The CLI wrapper is `khan`. The internal Python entrypoint remains:
 ```bash
 python scripts/khan_cli.py ...
 ```
+# khan
