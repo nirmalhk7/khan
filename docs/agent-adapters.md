@@ -9,7 +9,7 @@ status updates. Adapters only describe how to run and interpret a provider.
 `CodexAgentAdapter`
 
 - Provider name: `codex`
-- Command shape: `codex exec --json --output-last-message ...`
+- Command shape: `codex exec --json -m gpt-5.4-mini -c model_reasoning_effort="high" --output-last-message ...`
 - Prompt delivery: stdin
 - Event format: JSONL with fallback for plain text
 - External ID keys: `thread_id`, `session_id`, `chat_id`, `chatId`,

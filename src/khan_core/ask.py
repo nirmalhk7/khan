@@ -1,17 +1,30 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from .config import discover_project, load_config, save_config
 from .loop_engine import LoopEngine
-from .models import ProjectConfig, QueueItemRecord, RunRecord, TaskCapsule, TaskRecord
+from .models import PipelineRecord, ProjectConfig, QueueItemRecord, RunRecord, TaskCapsule, TaskRecord
+from .pipeline import PipelineRunner
 from .store import Store
 
 
 class AskError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AskOutcome:
+    task: TaskRecord
+    run: RunRecord | None = None
+    item: QueueItemRecord | None = None
+    pipeline: PipelineRecord | None = None
+    report_path: Path | None = None
+    mode: str = "pipeline"
 
 
 class AskRunner:
@@ -32,7 +45,11 @@ class AskRunner:
         verify: list[str] | None = None,
         enqueue: bool = False,
         priority: int = 100,
-    ) -> tuple[TaskRecord, RunRecord | None, QueueItemRecord | None]:
+        mode: str = "pipeline",
+        builder_providers: list[str] | None = None,
+    ) -> AskOutcome:
+        if mode not in {"pipeline", "single", "queue"}:
+            raise AskError("Mode must be one of: pipeline, single, queue")
         project = self._resolve_project(target)
         success_criteria = success or "The requested task is implemented and verified."
         verification = verify if verify is not None else project.validate_commands
@@ -50,32 +67,58 @@ class AskRunner:
             profile,
             capsule,
         )
-        if enqueue:
-            item = self.store.enqueue_task(task.id, priority=priority)
-            return task, None, item
+        if enqueue or mode == "queue":
+            item = self.store.enqueue_item(
+                "pipeline",
+                {
+                    "task_id": task.id,
+                    "planner_provider": "codex",
+                    "builder_providers": builder_providers or ["codex", "cursor-agent"],
+                },
+                priority=priority,
+            )
+            return AskOutcome(task=task, item=item, mode="queue")
+        if mode == "pipeline":
+            pipeline = PipelineRunner(self.config_path).run_pipeline(task, builder_providers=builder_providers)
+            return AskOutcome(
+                task=task,
+                pipeline=pipeline,
+                report_path=Path(pipeline.report_path) if pipeline.report_path else None,
+                mode="pipeline",
+            )
         engine = LoopEngine(self.config_path)
         run_id = engine.run_task(task.id)
-        return task, engine.store.get_run(run_id), None
+        return AskOutcome(task=task, run=engine.store.get_run(run_id), mode="single")
 
     def _resolve_project(self, target: str) -> ProjectConfig:
+        if target in self.config.projects and not self._looks_like_path(target):
+            return self.config.projects[target]
+
+        path = Path(target).expanduser()
+        if self._looks_like_path(target) or path.exists():
+            resolved = path.resolve()
+            root = self._git_root(resolved)
+            if root is None:
+                raise AskError("Ask targets must be inside a git repository.")
+
+            for project in self.config.projects.values():
+                if project.path == root:
+                    return project
+
+            project = discover_project(root, self._generated_project_name(root))
+            self.config.projects[project.name] = project
+            save_config(self.config, self.config_path)
+            return project
+
         if target in self.config.projects:
             return self.config.projects[target]
 
-        path = Path(target).expanduser().resolve()
-        if not path.exists():
-            raise AskError(f"Target is neither a configured project nor an existing path: {target}")
-        root = self._git_root(path)
-        if root is None:
-            raise AskError("Ask targets must be inside a git repository.")
+        raise AskError(f"Target is neither a configured project nor an existing path: {target}")
 
-        for project in self.config.projects.values():
-            if project.path == root:
-                return project
-
-        project = discover_project(root, self._generated_project_name(root))
-        self.config.projects[project.name] = project
-        save_config(self.config, self.config_path)
-        return project
+    def _looks_like_path(self, target: str) -> bool:
+        return target in {".", ".."} or target.startswith(("~", "./", "../")) or os.sep in target or (
+            os.altsep is not None and os.altsep in target
+        )
 
     def _generated_project_name(self, root: Path) -> str:
         base = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in root.name).strip("-") or "project"

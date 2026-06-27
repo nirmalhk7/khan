@@ -26,8 +26,24 @@ def _base_command(codex_bin: str) -> list[str]:
 
 
 class CodexCLI:
-    def __init__(self, codex_bin: str) -> None:
+    def __init__(
+        self,
+        codex_bin: str,
+        *,
+        model: str = "gpt-5.4-mini",
+        reasoning_effort: str = "high",
+    ) -> None:
         self.codex_bin = codex_bin
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+
+    def _exec_options(self) -> list[str]:
+        return [
+            "-m",
+            self.model,
+            "-c",
+            f'model_reasoning_effort="{self.reasoning_effort}"',
+        ]
 
     def exec_task(
         self,
@@ -49,8 +65,18 @@ class CodexCLI:
         idle_timeout_seconds: float | None = None,
     ) -> tuple[WorkerResult, list[dict[str, Any]]]:
         cmd = _base_command(self.codex_bin) + [
-            "exec", "--json", "--output-schema", str(schema_path), "--output-last-message",
-            str(output_path), "-C", str(workspace), "-s", project.sandbox, "-a", project.approval_policy, "-",
+            "exec",
+            "--json",
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(output_path),
+            *self._exec_options(),
+            "-C",
+            str(workspace),
+            "-s",
+            project.sandbox,
+            "-",
         ]
         process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -158,7 +184,7 @@ class CodexCLI:
 
     def review_changes(self, workspace: Path, prompt: str, uncommitted: bool = True,
                        timeout_seconds: float | None = None) -> ReviewResult:
-        cmd = _base_command(self.codex_bin) + ["review"]
+        cmd = _base_command(self.codex_bin) + ["review", *self._exec_options()]
         if uncommitted:
             cmd.append("--uncommitted")
         cmd.append("-")

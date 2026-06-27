@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
+from typer.completion import get_completion_script
 
 from .adoption import AdoptionError, AdoptionManager
 from .agent_adapters import agent_adapter_names
@@ -18,14 +19,18 @@ from .cross_review import CrossReviewError, CrossReviewRunner
 from .daemon import DaemonSupervisor, DaemonSupervisorError
 from .doctor import run_doctor
 from .duel import DuelError, DuelRunner
+from .inspection import InspectError, Inspector
+from .orchestration import OrchestrationError, OrchestrationRunner
 from .loop_engine import LoopEngine
 from .models import AgentProvider, TaskCapsule
+from .pipeline import PipelineError
 from .queue_worker import QueueWorker
 from .store import Store
 
 app = typer.Typer(
+    name="khan",
     no_args_is_help=True,
-    help="Khan orchestrates, records, and monitors local coding agents from one control plane.",
+    help="Khan runs multi-agent coding pipelines and presents adoption decisions.",
 )
 project_app = typer.Typer(no_args_is_help=True, help="Register and inspect repositories Khan can operate on.")
 task_app = typer.Typer(no_args_is_help=True, help="Create and run durable Codex task loops with validation.")
@@ -48,6 +53,27 @@ app.add_typer(duel_app, name="duel")
 app.add_typer(adoption_app, name="adoption")
 
 console = Console()
+GET_RESOURCE_ALIASES = {
+    "run": "runs",
+    "session": "sessions",
+    "queue-item": "queue",
+    "daemon": "daemons",
+    "duel": "duels",
+    "pipeline": "pipelines",
+    "cross-review": "cross-reviews",
+    "adoption": "adoptions",
+}
+GET_RESOURCE_CHOICES = {
+    "all",
+    "runs",
+    "sessions",
+    "queue",
+    "daemons",
+    "duels",
+    "pipelines",
+    "cross-reviews",
+    "adoptions",
+}
 
 
 @app.command()
@@ -71,6 +97,24 @@ def doctor() -> None:
     console.print(table)
 
 
+def _normalize_get_resource(value: str) -> str:
+    resource = GET_RESOURCE_ALIASES.get(value.strip().lower(), value.strip().lower())
+    if resource not in GET_RESOURCE_CHOICES:
+        raise typer.BadParameter(
+            "resource must be one of: all, runs, sessions, queue, daemons, duels, pipelines, cross-reviews, adoptions"
+        )
+    return resource
+
+
+def _print_table(title: str, headers: list[str], rows: list[list[str]]) -> None:
+    table = Table(title=title)
+    for header in headers:
+        table.add_column(header)
+    for row in rows:
+        table.add_row(*row)
+    console.print(table)
+
+
 @app.command()
 def ask(
     target: str,
@@ -80,13 +124,15 @@ def ask(
     profile: str | None = typer.Option(None, "--profile", help="Loop profile to use."),
     accept: list[str] | None = typer.Option(None, "--accept", help="Acceptance criterion; repeatable."),
     verify: list[str] | None = typer.Option(None, "--verify", help="Verification command; repeatable."),
-    enqueue: bool = typer.Option(False, "--enqueue", help="Create and queue the task instead of running immediately."),
+    enqueue: bool = typer.Option(False, "--enqueue", help="Compatibility alias for --mode queue."),
+    mode: str = typer.Option("pipeline", "--mode", help="Execution mode: pipeline, single, or queue."),
+    builder_provider: list[str] | None = typer.Option(None, "--builder-provider", help="Pipeline builder provider; repeatable."),
     priority: int = typer.Option(100, "--priority", help="Queue priority when using --enqueue."),
     config: Path | None = typer.Option(None, "--config", help="Config file path."),
 ) -> None:
-    """Create and run a zero-friction local task from a broad prompt."""
+    """Run a multi-agent pipeline from a broad prompt."""
     try:
-        task, run, item = AskRunner(config).ask(
+        outcome = AskRunner(config).ask(
             target,
             prompt,
             title=title,
@@ -96,19 +142,298 @@ def ask(
             verify=verify,
             enqueue=enqueue,
             priority=priority,
+            mode=mode,
+            builder_providers=builder_provider,
         )
-    except AskError as exc:
+    except (AskError, PipelineError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if item:
-        console.print(f"Created task {task.id} and queued item {item.id}")
+    if outcome.item:
+        console.print(f"Created task {outcome.task.id} and queued pipeline item {outcome.item.id}")
         return
-    assert run is not None
-    console.print(f"Created task {task.id}; run {run.id} finished with status {run.status}")
+    if outcome.pipeline:
+        console.print(f"Created task {outcome.task.id}; pipeline {outcome.pipeline.id} finished with status {outcome.pipeline.status}")
+        if outcome.report_path:
+            console.print(f"Report: {outcome.report_path}")
+        console.print(Inspector(config).evidence_markdown(outcome.pipeline.id), end="")
+        return
+    assert outcome.run is not None
+    console.print(f"Created task {outcome.task.id}; run {outcome.run.id} finished with status {outcome.run.status}")
+    console.print(Inspector(config).evidence_markdown(outcome.run.id), end="")
+
+
+@app.command()
+def last(
+    kind: str = typer.Option("any", "--kind", help="Record type to inspect: any, task, run, session, queue, daemon, duel, pipeline, cross-review, adoption."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a summary."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show the most recent Khan record of a given type."""
+    try:
+        inspector = Inspector(config)
+        record = inspector.last(kind)
+    except InspectError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        console.print_json(json.dumps(inspector.evidence_payload(record.id)))
+        return
+    console.print(inspector.summary_markdown(record.id))
+
+
+@app.command()
+def show(
+    record_id: str,
+    provider: str | None = typer.Option(None, "--provider", help="Provider to inspect for multi-candidate records."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show the human-readable decision and evidence view for a Khan record."""
+    try:
+        console.print(Inspector(config).evidence_markdown(record_id, provider=provider), end="")
+    except InspectError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command("get")
+def ps(
+    resource: str = typer.Argument(
+        "all",
+        help="Resource to show: all, runs, sessions, queue, daemons, duels, pipelines, cross-reviews, or adoptions.",
+    ),
+    active: bool = typer.Option(True, "--active/--all", help="Show only active records by default."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show a resource list, or the active cluster view when no resource is given."""
+    resource = _normalize_get_resource(resource)
+    if resource == "all":
+        inspector = Inspector(config)
+        rows = inspector.active_rows()
+        if active:
+            rows = [
+                row
+                for row in rows
+                if row["status"] in {"queued", "running", "stopping", "needs_human", "awaiting_decision", "paused"}
+            ]
+        _print_table(
+            "Khan get",
+            ["Type", "ID", "Project", "Status", "Summary", "Next"],
+            [[row["type"], row["id"][:8], row["project"], row["status"], row["summary"], row["next"]] for row in rows],
+        )
+        return
+
+    loaded = load_config(config)
+    store = Store(loaded.global_config.state_dir)
+    if resource == "runs":
+        runs = store.list_runs(active_only=active)
+        _print_table(
+            "Runs",
+            ["Run", "Project", "Status", "Iteration", "Summary"],
+            [[run.id[:8], run.project, run.status, str(run.iteration), run.summary or "-"] for run in runs],
+        )
+        return
+    if resource == "sessions":
+        sessions = store.list_agent_sessions(active_only=active)
+        _print_table(
+            "Sessions",
+            ["Session", "Provider", "Project", "Status", "Workspace", "External"],
+            [
+                [
+                    session.id[:8],
+                    session.provider,
+                    session.project,
+                    session.status,
+                    session.workspace,
+                    session.external_id or "-",
+                ]
+                for session in sessions
+            ],
+        )
+        return
+    if resource == "queue":
+        items = store.list_queue_items(limit=200)
+        if active:
+            items = [item for item in items if item.status in {"queued", "running"}]
+        _print_table(
+            "Queue",
+            ["Item", "Kind", "Status", "Priority", "Result", "Error"],
+            [[item.id[:8], item.kind, item.status, str(item.priority), item.result_id or "-", item.error or "-"] for item in items],
+        )
+        return
+    if resource == "daemons":
+        daemons = store.list_daemons(active_only=active, limit=50)
+        _print_table(
+            "Daemons",
+            ["Daemon", "PID", "Status", "Heartbeat", "Last Item", "Error"],
+            [
+                [
+                    daemon.id[:8],
+                    str(daemon.pid),
+                    daemon.status,
+                    daemon.heartbeat_at.isoformat(),
+                    daemon.last_queue_item_id[:8] if daemon.last_queue_item_id else "-",
+                    daemon.error or "-",
+                ]
+                for daemon in daemons
+            ],
+        )
+        return
+    if resource == "duels":
+        duels = store.list_duels(active_only=active, limit=100)
+        _print_table(
+            "Duels",
+            ["Duel", "Project", "Status", "Providers", "Summary"],
+            [[duel.id[:8], duel.project, duel.status, ", ".join(duel.providers), duel.summary or "-"] for duel in duels],
+        )
+        return
+    if resource == "pipelines":
+        pipelines = store.list_pipelines(active_only=active, limit=100)
+        _print_table(
+            "Pipelines",
+            ["Pipeline", "Project", "Status", "Recommended", "Summary"],
+            [[p.id[:8], p.project, p.status, p.recommended_provider or "-", p.decision_summary or "-"] for p in pipelines],
+        )
+        return
+    if resource == "cross-reviews":
+        reviews = store.list_cross_reviews(active_only=active, limit=100)
+        _print_table(
+            "Cross-Reviews",
+            ["CrossReview", "Duel", "Status", "Summary"],
+            [[review.id[:8], review.duel_id[:8], review.status, review.summary or "-"] for review in reviews],
+        )
+        return
+    adoptions = store.list_adoption_decisions(limit=100)
+    _print_table(
+        "Adoptions",
+        ["Decision", "Status", "Target", "Provider", "Project", "Files", "Summary"],
+        [
+            [
+                decision.id[:8],
+                decision.status,
+                f"{decision.target_type}:{decision.target_id[:8]}",
+                decision.provider or "-",
+                decision.project,
+                str(len(decision.changed_files)),
+                decision.error or decision.summary or "-",
+            ]
+            for decision in adoptions
+        ],
+    )
+
+
+@app.command()
+def diff(
+    selector: str,
+    provider: str | None = typer.Option(None, "--provider", help="Provider for duel records."),
+    stat: bool = typer.Option(False, "--stat", help="Print diff stat instead of a patch."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show the git diff for a recorded run, session, adoption, or duel participant."""
+    try:
+        text = Inspector(config).diff_text(selector, provider=provider, stat=stat)
+    except InspectError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(text, end="")
+
+
+@app.command()
+def summary(
+    selector: str,
+    provider: str | None = typer.Option(None, "--provider", help="Provider for duel records."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show a short markdown summary for a recorded Khan object."""
+    try:
+        text = Inspector(config).summary_markdown(selector)
+    except InspectError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(text, end="")
+
+
+@app.command()
+def explain(
+    selector: str,
+    provider: str | None = typer.Option(None, "--provider", help="Provider for duel records."),
+    json_output: bool = typer.Option(False, "--json", help="Print structured evidence instead of markdown."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Render the evidence ledger for a recorded Khan object."""
+    try:
+        inspector = Inspector(config)
+        if json_output:
+            console.print_json(json.dumps(inspector.evidence_payload(selector, provider=provider)))
+            return
+        console.print(inspector.evidence_markdown(selector, provider=provider), end="")
+    except InspectError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def relay(
+    target: str,
+    prompt: str,
+    first: str = typer.Option("codex", "--first", help="First provider to run."),
+    second: str = typer.Option("cursor-agent", "--second", help="Second provider to run."),
+    preset: str | None = typer.Option(None, "--preset", help="Named relay preset to use instead of explicit providers."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Run a two-step provider relay over the same local task."""
+    try:
+        outcome = OrchestrationRunner(config).relay(target, prompt, first=first, second=second, preset=preset)
+    except OrchestrationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(
+        f"Relay finished: {outcome.first_session_id[:8]} -> {outcome.second_session_id[:8]}"
+        f" (handoff {outcome.handoff_path})"
+    )
+
+
+@app.command()
+def replay(
+    run_id: str,
+    provider: str = typer.Option("codex", "--provider", help="Replay provider: codex or cursor-agent."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Replay an existing run with the same task and project context."""
+    try:
+        outcome = OrchestrationRunner(config).replay(run_id, provider)
+    except OrchestrationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Replay {outcome.run_id} finished with status {outcome.status} using {outcome.provider}")
+
+
+@app.command()
+def bench(
+    path: Path,
+    provider: str | None = typer.Option(None, "--provider", help="Default replay provider."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Run a repeatable replay benchmark from a YAML prompt list."""
+    try:
+        outcome = OrchestrationRunner(config).bench(path, provider=provider)
+    except OrchestrationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Bench completed with {len(outcome.results)} result(s).")
+    if outcome.markdown_path:
+        console.print(f"Report: {outcome.markdown_path}")
+
+
+@app.command()
+def steer(
+    session_id: str,
+    message: str,
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Continue an existing provider session or fork it with a new message."""
+    try:
+        outcome = OrchestrationRunner(config).steer(session_id, message)
+    except OrchestrationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"Steered session {session_id[:8]} -> {outcome.session_id[:8]} (forked={outcome.forked})")
 
 
 @project_app.command("add")
 def project_add(name: str, path: Path) -> None:
     """Register a project and infer basic validation commands."""
+    if name in {".", ".."} or "/" in name or "\\" in name:
+        raise typer.BadParameter("Project name must be a simple name, not a path-like value.")
     config = load_config()
     project = discover_project(path.expanduser().resolve(), name)
     config.projects[name] = project
@@ -279,9 +604,10 @@ def session_start(
     project: str,
     prompt: str = typer.Option(..., "--prompt"),
     worktree: bool = typer.Option(False, "--worktree", help="Force an isolated git worktree for this session."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
 ) -> None:
     """Start a one-shot headless session through a registered agent adapter."""
-    runner = AgentSessionRunner()
+    runner = AgentSessionRunner(config)
     session_id = runner.start_session(_provider(provider), project, prompt, force_worktree=worktree)
     session = runner.store.get_agent_session(session_id)
     console.print(f"Session {session.id} finished with status {session.status}")
@@ -294,10 +620,11 @@ def session_enqueue(
     prompt: str = typer.Option(..., "--prompt"),
     worktree: bool = typer.Option(False, "--worktree", help="Force an isolated git worktree for this session."),
     priority: int = typer.Option(100, "--priority"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
 ) -> None:
     """Enqueue an agent session for daemon/worker execution."""
-    config = load_config()
-    item = Store(config.global_config.state_dir).enqueue_session(
+    loaded = load_config(config)
+    item = Store(loaded.global_config.state_dir).enqueue_session(
         _provider(provider),
         project,
         prompt,
@@ -472,11 +799,28 @@ def adopt(
     provider: str | None = typer.Option(None, "--provider", help="Provider when adopting a duel participant."),
     force: bool = typer.Option(False, "--force", help="Allow adoption into a dirty destination worktree."),
     cleanup: bool = typer.Option(False, "--cleanup", help="Remove the source worktree after adoption."),
+    preview: bool = typer.Option(False, "--preview", help="Show a confirmation preview before adopting."),
+    validate: bool = typer.Option(False, "--validate/--no-validate", help="Run project validation after copying."),
+    commit: bool = typer.Option(False, "--commit", help="Create a git commit after adoption."),
+    commit_message: str | None = typer.Option(None, "--commit-message", help="Commit message to use with --commit."),
     config: Path | None = typer.Option(None, "--config", help="Config file path."),
 ) -> None:
     """Adopt changes from a run, session, or duel participant into the project checkout."""
+    manager = AdoptionManager(config)
+    if preview:
+        console.print(manager.preview_markdown(target_id, provider=provider, validate=validate, cleanup=cleanup), end="")
+        if not typer.confirm("Proceed with adoption?", default=False):
+            raise typer.Abort()
     try:
-        decision = AdoptionManager(config).adopt(target_id, provider=provider, force=force, cleanup=cleanup)
+        decision = manager.adopt(
+            target_id,
+            provider=provider,
+            force=force,
+            cleanup=cleanup,
+            validate=validate,
+            commit=commit,
+            commit_message=commit_message,
+        )
     except AdoptionError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"Adopted {decision.target_type} {decision.target_id} as decision {decision.id}")
@@ -488,15 +832,31 @@ def reject(
     target_id: str,
     provider: str | None = typer.Option(None, "--provider", help="Provider when rejecting a duel participant."),
     cleanup: bool = typer.Option(True, "--cleanup/--keep-worktree", help="Remove the source worktree after rejection."),
+    preview: bool = typer.Option(False, "--preview", help="Show a confirmation preview before rejecting."),
     config: Path | None = typer.Option(None, "--config", help="Config file path."),
 ) -> None:
     """Reject changes from a run, session, or duel participant."""
+    manager = AdoptionManager(config)
+    if preview:
+        console.print(manager.preview_markdown(target_id, provider=provider, cleanup=cleanup), end="")
+        if not typer.confirm("Proceed with rejection?", default=False):
+            raise typer.Abort()
     try:
-        decision = AdoptionManager(config).reject(target_id, provider=provider, cleanup=cleanup)
+        decision = manager.reject(target_id, provider=provider, cleanup=cleanup)
     except AdoptionError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"Rejected {decision.target_type} {decision.target_id} as decision {decision.id}")
     console.print(decision.summary)
+
+
+@adoption_app.command("prune")
+def adoption_prune(
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Prune expired retained adoption worktrees."""
+    manager = AdoptionManager(config)
+    cleaned = manager.prune_retained_worktrees()
+    console.print(f"Pruned {cleaned} retained worktree(s)")
 
 
 @adoption_app.command("list")
@@ -617,6 +977,19 @@ def cross_review_artifacts(
 
 
 @app.command()
+def completion(
+    shell: str = typer.Argument(..., help="Shell name: bash, zsh, fish, powershell, or pwsh."),
+) -> None:
+    """Print a shell completion script for the Khan CLI."""
+    if shell not in {"bash", "zsh", "fish", "powershell", "pwsh"}:
+        raise typer.BadParameter("shell must be one of: bash, zsh, fish, powershell, pwsh")
+    console.print(
+        get_completion_script(prog_name="khan", complete_var="_KHAN_COMPLETE", shell=shell),
+        end="",
+    )
+
+
+@app.command()
 def review(run_id: str) -> None:
     """Run Codex review on the workspace for an existing run."""
     engine = LoopEngine()
@@ -625,10 +998,13 @@ def review(run_id: str) -> None:
 
 
 @app.command()
-def attention() -> None:
-    """Show runs, sessions, queue items, daemons, duels, and cross-reviews ordered by priority."""
-    config = load_config()
-    router = AttentionRouter(Store(config.global_config.state_dir))
+def inbox(
+    all: bool = typer.Option(False, "--all", help="Include historical and healthy records."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Show actionable decision cards ordered by priority."""
+    loaded = load_config(config)
+    router = AttentionRouter(Store(loaded.global_config.state_dir))
     table = Table(title="Attention")
     table.add_column("Score")
     table.add_column("Type")
@@ -636,10 +1012,22 @@ def attention() -> None:
     table.add_column("Class")
     table.add_column("Summary")
     table.add_column("Next")
-    for card in router.cards():
+    cards = router.cards()
+    if not all:
+        cards = [card for card in cards if card.classification in {"decision_required", "watch", "stopped"}]
+    for card in cards:
         next_action = card.recommended_actions[0] if card.recommended_actions else "-"
         table.add_row(str(card.score), card.subject_type, card.run_id[:8], card.classification, card.summary, next_action)
     console.print(table)
+
+
+@app.command()
+def attention(
+    all: bool = typer.Option(False, "--all", help="Include historical and healthy records."),
+    config: Path | None = typer.Option(None, "--config", help="Config file path."),
+) -> None:
+    """Compatibility alias for inbox."""
+    inbox(all=all, config=config)
 
 
 @app.command()
@@ -754,6 +1142,19 @@ def daemon_status(
     console.print(table)
 
 
+@daemon_app.command("logs")
+def daemon_logs(
+    limit: int = typer.Option(20, "--limit"),
+    config: Path | None = typer.Option(None, "--config", help="Config file path for the daemon state store."),
+) -> None:
+    """Print recent daemon lifecycle records."""
+    for daemon in DaemonSupervisor(config).status()[:limit]:
+        console.print(
+            f"{daemon.started_at.isoformat()} [{daemon.status}] {daemon.id[:8]} "
+            f"pid={daemon.pid} last={daemon.last_queue_item_id or '-'} error={daemon.error or '-'}"
+        )
+
+
 @daemon_app.command("stop")
 def daemon_stop(
     daemon_id: str | None = typer.Option(None, "--daemon-id"),
@@ -767,6 +1168,8 @@ def daemon_stop(
     console.print(f"Stop requested for daemon {daemon.id} status={daemon.status}")
 
 
+@run_app.command("watch")
+@app.command("watch")
 @app.command()
 def watch(run_id: str, poll_seconds: float = 1.5) -> None:
     """Follow run status and events until the run reaches a terminal or human-input state."""
@@ -797,7 +1200,7 @@ def tui() -> None:
     KhanApp().run()
 
 
-@app.command()
+@task_app.command("list")
 def list_tasks() -> None:
     """List stored tasks."""
     config = load_config()

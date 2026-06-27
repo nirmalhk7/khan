@@ -1,181 +1,83 @@
-# Khan TODO
+# TODO
 
-Khan is a local-first orchestration layer for Codex and Cursor Agent. It should
-optimize for a developer actively supervising local coding work: fast task setup,
-parallel provider comparison, strong evidence capture, safe adoption of changes,
-and recoverable agent sessions.
+## Implementation Plan
 
-## Implemented
+### 1. Full-access project policy
 
-- Versioned SQLite migrations and durable local state.
-- Durable tasks, task capsules, task runs, agent sessions, events, artifacts,
-  process IDs, heartbeats, commands, failure fingerprints, and external session
-  IDs.
-- Codex task loop with structured output, JSONL capture, validation, optional
-  review, runtime timeout, idle timeout, pause/resume/cancel polling, retry
-  limits, repeated-failure detection, empty-diff stop, allowed-path enforcement,
-  and protected-path stop.
-- Task capsules with acceptance criteria, expected files, allowed paths,
-  protected paths, verification recipes, blast radius, dependencies, and conflict
-  domains.
-- Zero-friction `khan ask <project-or-path> "prompt"` for broad local tasks,
-  with git-root project auto-discovery, validation inference, immediate run, and
-  enqueue mode.
-- Conflict-domain scheduling guard for active task runs.
-- Durable queue items for task runs and agent sessions.
-- Foreground queue worker, detached daemon supervisor, daemon heartbeat/status,
-  stale lease recovery, and success/failure recording.
-- Worktree-by-default isolation and failed-worktree cleanup.
-- Provider-neutral agent sessions with built-in `codex` and `cursor-agent`
-  adapters.
-- Adapter registry for future providers.
-- Provider duel records with `khan duel run <project-or-path> "prompt"`,
-  `khan duel list`, `khan duel show`, and `khan duel artifacts`.
-- Duel participants run through the adapter layer in isolated git worktrees and
-  capture transcript, changed files including untracked files, diff stat,
-  validation result, runtime, summary, open risks, and participant artifacts.
-- `duel-report.md` compares provider candidates and duels appear in attention
-  cards and metrics.
-- Manual `khan adopt` and `khan reject` for run, session, and duel participant
-  workspaces, with dirty-destination refusal, optional source cleanup, protected
-  path summaries, failed-attempt recording, and `khan adoption list`.
-- Cross-review records with `khan cross-review <duel-id>`,
-  `khan cross-review-list`, `khan cross-review-show`, and
-  `khan cross-review-artifacts`.
-- Cross-review critiques run each completed duel provider against the other
-  provider's diff through the adapter/session layer and store critique artifacts
-  plus a `cross-review-report.md`.
-- macOS `say` notification when task runs enter `needs_human`.
-- Attention router and JSON metrics command.
-- CLI docs, README, configuration docs, adapter docs, and operations docs.
-- Test coverage with fake Codex, Cursor Agent, and `say` binaries.
+Goal: let Khan operate with broad local authority inside the repository by default, including package installation and other normal setup commands.
 
-## Khan-Unique Roadmap
+- Add an explicit project-level policy block in config, for example:
 
-### 1. Zero-Friction Local Tasks
+  ```yaml
+  projects:
+    khan:
+      access_policy:
+        filesystem: full
+        shell: full
+        package_install: allowed
+        network: restricted
+  ```
 
-- Add `khan last`, `khan ps`, `khan diff <id>`, `khan summary <id>`, and
-  unambiguous partial ID resolution.
-- Add richer `ask` planning modes, including optional duel-backed ask and
-  explicit evidence rendering after the run completes.
+- Treat `package_install: allowed` as permission for common local package-manager commands such as `npm install`, `pip install`, `uv sync`, `cargo install`, or equivalent repo-local setup steps.
+- Keep the policy scoped to the repository workspace. It should not imply host-wide access outside the repo or secret-bearing paths.
+- If a project needs a narrower policy later, let it override the default at the project level instead of changing global behavior.
 
-### 2. Provider Duel Polish
+### 2. Web query allowlist
 
-- Run duel participants concurrently once scheduler support can preserve
-  deterministic tests and clear output.
-- Attach task capsules directly to duels instead of storing only the prompt.
-- Add richer winner heuristics that account for validation, review findings,
-  diff size, protected paths, and operator adoption history.
+Goal: any web access should be explicitly constrained by a glob-based domain allowlist.
 
-### 3. Cross-Review Polish
+- Add a web policy field to config, for example:
 
-- Parse reviewer verdicts into structured strongest-implementation,
-  reviewer-disagreement, and required-human-inspection fields.
-- Feed cross-review findings back into adopt/reject warnings.
-- Add optional automatic adoption recommendation from validation plus
-  cross-review results.
+  ```yaml
+  global:
+    web_allowed_domains:
+      - "*.python.org"
+      - "*.npmjs.com"
+      - "docs.*.com"
+  ```
 
-### 4. Relay Mode
+- Match domains using glob semantics against the request host before any web fetch or browser action occurs.
+- Reject or pause requests that do not match an allowed glob and record the denied host in the run/session evidence.
+- Keep the allowlist auditable by showing the resolved glob list in `khan doctor`, `khan summary`, or a dedicated config inspection command.
 
-- Add `khan relay . "prompt" --first codex --second cursor-agent`.
-- First provider plans or implements.
-- Second provider continues from the first provider's workspace or critique.
-- Support preset relays:
-  - `codex-plan cursor-build`
-  - `cursor-build codex-review`
-  - `codex-fix cursor-polish`
-- Persist every handoff prompt as an artifact so relays are inspectable.
+### 3. Reduce instruction requests
 
-### 5. Patch Adoption Polish
+Goal: stop asking the operator for the same safe defaults repeatedly.
 
-- Add `khan diff <id>` preview before adoption.
-- Add an interactive confirmation flow that shows changed files, validation
-  status, protected-path warnings, and destination dirty state.
-- Add optional post-adoption validation.
-- Add optional commit creation after adoption.
-- Add a retention policy for accepted/rejected worktrees.
+- Move reusable defaults into config first:
+  - allowed package managers
+  - trusted web domain globs
+  - preferred validation commands
+  - default review prompt text
+- Teach task creation to inherit project policy automatically so `ask` and `task create` only ask for exceptions.
+- Add a prompt-builder rule that includes the active policy in the task prompt only once, so the agent sees it up front and does not re-request it mid-run.
+- Prefer a deny-by-exception model: if something is not in the config policy, Khan should ask once, store the exception, and reuse it for the same project/task shape.
 
-### 6. Replay And Benchmarking
+### 4. Code changes this implies
 
-- Add `khan replay <run-id> --provider codex|cursor-agent`.
-- Reuse the original task capsule, prompt, validation recipe, and project state.
-- Add `khan bench prompts.yaml` for repeatable provider evaluation.
-- Score each run using:
-  - validation pass/fail
-  - number of iterations
-  - review verdict
-  - protected/allowed path compliance
-  - human adoption decision
-  - runtime
-- Export benchmark results as JSON and Markdown.
+- `src/khan_core/models.py`
+  - add an access-policy model and a web-allowlist field
+  - keep defaults conservative enough that existing configs still load
+- `src/khan_core/config.py`
+  - load and persist the new config fields
+  - ensure defaults are written to `DEFAULT_CONFIG`
+- `src/khan_core/prompt_builder.py`
+  - inject the active policy into the worker prompt
+- `src/khan_core/loop_engine.py`
+  - apply the policy before any web-querying step or package-install step
+  - record denied operations as events
+- `src/khan_core/cli.py`
+  - expose the new policy in help text or inspection output
+- `docs/configuration.md`
+  - document the policy schema and examples
+- `docs/cli.md` / `docs/operations.md`
+  - document how the policy reduces instruction churn in day-to-day use
+- `tests/test_foundation.py`
+  - cover config loading/saving, allowlist matching, denied web access, and package-install-allowed paths
 
-### 7. Same-Session Steering
+### 5. Acceptance criteria
 
-- Add `khan steer <session-id> "message"` for provider sessions where resume or
-  continued input is supported.
-- Add adapter methods:
-  - `resume_command`
-  - `send_message`
-  - `supports_steering`
-- Codex steering should use captured external session IDs when possible.
-- Cursor Agent steering should use its external chat/session ID when possible.
-- If a provider cannot steer, Khan should create a continuation session with the
-  prior transcript and mark it as a fork.
-
-### 8. Evidence Ledger
-
-- Add a run-level `evidence.md` artifact summarizing:
-  - objective
-  - capsule constraints
-  - provider
-  - commands run
-  - files changed
-  - validation output
-  - review output
-  - risks
-  - final recommendation
-- Add `khan explain <id>` to render this evidence in the terminal.
-- Add JSON output for scripts: `khan explain <id> --json`.
-
-### 9. TUI As Local Cockpit
-
-- Upgrade the Textual TUI around local decision-making, not fleet PR monitoring.
-- Add panes for:
-  - active runs
-  - duels
-  - provider sessions
-  - evidence
-  - diff summary
-  - validation output
-- Add keybindings:
-  - `d` diff
-  - `e` evidence
-  - `a` adopt
-  - `x` reject
-  - `r` replay
-  - `s` steer
-  - `c` cancel
-- Show Codex and Cursor Agent outputs side-by-side for duel records.
-
-### 10. Detached Supervision Polish
-
-- Add automatic crash restart policy for failed daemon records.
-- Add `khan daemon logs`.
-- Add launchd/systemd templates for users who want OS-level supervision.
-- Add stale daemon heartbeat detection thresholds in config.
-
-## Test Plan
-
-- CLI tests for partial IDs, `duel`, `cross-review`, `relay`, `adopt`,
-  `reject`, `replay`, `bench`, and `explain`.
-- Store migration tests for duel records, adoption decisions, replay metadata,
-  and evidence artifacts.
-- Fake Codex and fake Cursor Agent tests for provider duel and cross-review.
-- Worktree tests for safe adoption, dirty-destination refusal, and rejection
-  cleanup.
-- Adapter tests for steering support and continuation fallback.
-- TUI smoke tests for duel view, evidence view, and action keybindings.
-
-## Provider Constraint
-
-Codex and Cursor Agent are the supported providers for now.
+- A configured project can run without repeated permission prompts for normal local setup work.
+- Web access is blocked unless the host matches one of the configured glob patterns.
+- The allowlist and access policy are visible in config/docs and are covered by tests.
+- Existing configs continue to load without migration breakage.

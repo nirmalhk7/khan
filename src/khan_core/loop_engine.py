@@ -22,7 +22,11 @@ class LoopEngine:
     def __init__(self, config_path: Path | None = None) -> None:
         self.config = load_config(config_path)
         self.store = Store(self.config.global_config.state_dir)
-        self.codex = CodexCLI(self.config.global_config.codex_bin)
+        self.codex = CodexCLI(
+            self.config.global_config.codex_bin,
+            model=self.config.global_config.codex_model,
+            reasoning_effort=self.config.global_config.codex_reasoning_effort,
+        )
         self.validator = Validator()
         self.reviewer = Reviewer(self.codex)
         self.worktrees = WorktreeManager(self.config.global_config.state_dir)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from .models import AgentSessionRecord, CrossReviewRecord, DaemonRecord, DecisionCard, DuelRecord, QueueItemRecord, RunRecord
+from .models import AgentSessionRecord, CrossReviewRecord, DaemonRecord, DecisionCard, DuelRecord, PipelineRecord, QueueItemRecord, RunRecord
 from .store import Store
 
 
@@ -23,6 +23,8 @@ class AttentionRouter:
             cards.append(self._daemon_card(daemon))
         for duel in self.store.list_duels(limit=50):
             cards.append(self._duel_card(duel))
+        for pipeline in self.store.list_pipelines(limit=50):
+            cards.append(self._pipeline_card(pipeline))
         for cross_review in self.store.list_cross_reviews(limit=50):
             cards.append(self._cross_review_card(cross_review))
         return sorted(cards, key=lambda card: card.score, reverse=True)
@@ -42,6 +44,8 @@ class AttentionRouter:
         adoption_statuses = Counter(adoption.status for adoption in adoptions)
         cross_reviews = self.store.list_cross_reviews(limit=100)
         cross_review_statuses = Counter(cross_review.status for cross_review in cross_reviews)
+        pipelines = self.store.list_pipelines(limit=100)
+        pipeline_statuses = Counter(pipeline.status for pipeline in pipelines)
         decision_cards = self.cards()
         return {
             "runs": {
@@ -94,6 +98,12 @@ class AttentionRouter:
                 "status_counts": dict(sorted(cross_review_statuses.items())),
                 "awaiting_decision": cross_review_statuses.get("awaiting_decision", 0),
                 "failed": cross_review_statuses.get("failed", 0),
+            },
+            "pipelines": {
+                "total": len(pipelines),
+                "status_counts": dict(sorted(pipeline_statuses.items())),
+                "awaiting_decision": pipeline_statuses.get("awaiting_decision", 0),
+                "failed": pipeline_statuses.get("failed", 0),
             },
         }
 
@@ -322,3 +332,72 @@ class AttentionRouter:
             evidence=[f"duel={cross_review.duel_id}", f"status={cross_review.status}"],
             recommended_actions=[f"khan cross-review-show {cross_review.id}"],
         )
+
+    def _pipeline_card(self, pipeline: PipelineRecord) -> DecisionCard:
+        phases = self.store.list_pipeline_phases(pipeline.id)
+        risks = [
+            line.removeprefix("- ").strip()
+            for phase in phases
+            for line in phase.summary.splitlines()
+            if "risk" in line.lower()
+        ][:5]
+        if pipeline.status == "awaiting_decision":
+            action = (
+                f"khan adopt {pipeline.id} --provider {pipeline.recommended_provider}"
+                if pipeline.recommended_provider
+                else f"khan show {pipeline.id}"
+            )
+            return DecisionCard(
+                run_id=pipeline.id,
+                subject_type="pipeline",
+                classification="decision_required",
+                score=100,
+                summary=pipeline.decision_summary or f"Pipeline {pipeline.id[:8]} is awaiting adoption decision.",
+                evidence=[f"project={pipeline.project}", f"recommended={pipeline.recommended_provider or '-'}"],
+                recommended_actions=[action, f"khan show {pipeline.id}", f"khan reject {pipeline.id}"],
+                recommended_provider=pipeline.recommended_provider,
+                confidence=self._confidence_from_summary(pipeline.decision_summary),
+                primary_action=action,
+                secondary_actions=[f"khan show {pipeline.id}", f"khan reject {pipeline.id}"],
+                risks=risks,
+            )
+        if pipeline.status in {"queued", "planning", "building", "reviewing"}:
+            return DecisionCard(
+                run_id=pipeline.id,
+                subject_type="pipeline",
+                classification="watch",
+                score=70,
+                summary=pipeline.decision_summary or f"Pipeline {pipeline.id[:8]} is {pipeline.status}.",
+                evidence=[f"project={pipeline.project}", f"status={pipeline.status}"],
+                recommended_actions=[f"khan show {pipeline.id}"],
+            )
+        if pipeline.status == "failed":
+            return DecisionCard(
+                run_id=pipeline.id,
+                subject_type="pipeline",
+                classification="stopped",
+                score=85,
+                summary=pipeline.decision_summary or f"Pipeline {pipeline.id[:8]} failed.",
+                evidence=[f"project={pipeline.project}", f"status={pipeline.status}"],
+                recommended_actions=[f"khan show {pipeline.id}"],
+                risks=risks,
+            )
+        return DecisionCard(
+            run_id=pipeline.id,
+            subject_type="pipeline",
+            classification="healthy",
+            score=1,
+            summary=pipeline.decision_summary or f"Pipeline {pipeline.id[:8]} is {pipeline.status}.",
+            evidence=[f"project={pipeline.project}", f"status={pipeline.status}"],
+            recommended_actions=[f"khan show {pipeline.id}"],
+        )
+
+    def _confidence_from_summary(self, summary: str) -> str | None:
+        lowered = summary.lower()
+        if "high confidence" in lowered:
+            return "high"
+        if "medium confidence" in lowered:
+            return "medium"
+        if "low confidence" in lowered:
+            return "low"
+        return None

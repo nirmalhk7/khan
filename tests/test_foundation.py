@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import io
+import os
 import sqlite3
 import stat
 import subprocess
@@ -26,7 +29,7 @@ from khan_core.cross_review import CrossReviewRunner
 from khan_core.daemon import DaemonSupervisor
 from khan_core.duel import DuelRunner
 from khan_core.loop_engine import LoopEngine
-from khan_core.models import AgentSessionEvent, ProjectConfig, RunProcess, TaskCapsule
+from khan_core.models import AgentSessionEvent, ConfigFile, ProjectConfig, RunProcess, TaskCapsule
 from khan_core.queue_worker import QueueWorker, QueueWorkerError
 from khan_core.store import RunLockedError, Store
 
@@ -97,7 +100,7 @@ class FoundationTests(unittest.TestCase):
     def test_migrations_and_run_lock(self) -> None:
         store = Store(self.root / "state")
         with store._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 13)
         task = store.create_task("p", "t", "p", "s", None)
         run = store.create_run(task.id, "p", str(self.root))
         with store.run_lock(run.id):
@@ -124,7 +127,7 @@ class FoundationTests(unittest.TestCase):
             """)
         store = Store(state)
         with store._connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 13)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
         self.assertIn("process_id", columns)
 
@@ -144,6 +147,262 @@ class FoundationTests(unittest.TestCase):
 
         store.set_task_capsule(task.id, capsule.model_copy(update={"blast_radius": "medium"}))
         self.assertEqual(store.get_task_capsule(task.id).blast_radius, "medium")
+
+    def test_root_help_uses_khan_program_name(self) -> None:
+        result = CliRunner().invoke(app, ["--help"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Usage: khan", result.output)
+        self.assertIn("--install-completion", result.output)
+        self.assertIn("--show-completion", result.output)
+        self.assertIn("ask", result.output)
+        self.assertIn("inbox", result.output)
+        self.assertIn("show", result.output)
+        self.assertIn("get", result.output)
+        self.assertNotIn("describe", result.output)
+        self.assertNotIn("apply", result.output)
+        self.assertNotIn("delete", result.output)
+
+    def test_task_help_exposes_list_alias(self) -> None:
+        result = CliRunner().invoke(app, ["task", "--help"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("│ list", result.output)
+
+    def test_run_help_exposes_watch_alias(self) -> None:
+        result = CliRunner().invoke(app, ["run", "--help"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("│ watch", result.output)
+
+    def test_task_list_alias_lists_tasks(self) -> None:
+        config = ConfigFile()
+        config.global_config.state_dir = self.root / "state"
+        store = Store(config.global_config.state_dir)
+        task = store.create_task("p", "title", "prompt", "success", None)
+
+        with mock.patch("khan_core.cli.load_config", return_value=config):
+            result = CliRunner().invoke(app, ["task", "list"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(task.id[:8], result.output)
+
+    def test_get_alias_lists_active_records(self) -> None:
+        config = ConfigFile()
+        config.global_config.state_dir = self.root / "state"
+        store = Store(config.global_config.state_dir)
+        task = store.create_task("p", "title", "prompt", "success", None)
+        run = store.create_run(task.id, "p", str(self.root))
+        store.update_run(run.id, "running", "active")
+
+        with mock.patch("khan_core.cli.load_config", return_value=config):
+            result = CliRunner().invoke(app, ["get", "runs"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(run.id[:8], result.output)
+        self.assertIn("Runs", result.output)
+
+    def test_get_sessions_lists_active_sessions(self) -> None:
+        config = ConfigFile()
+        config.global_config.state_dir = self.root / "state"
+        store = Store(config.global_config.state_dir)
+        session = store.create_agent_session("codex", "p", str(self.root), "prompt")
+        store.start_agent_session(session.id, 123)
+
+        with mock.patch("khan_core.cli.load_config", return_value=config):
+            result = CliRunner().invoke(app, ["get", "sessions"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(session.id[:8], result.output)
+        self.assertIn("Sessions", result.output)
+
+    def test_adopt_and_reject_delegate_to_adoption_manager(self) -> None:
+        manager = mock.Mock()
+        manager.adopt.return_value = mock.Mock(
+            target_type="run",
+            target_id="target-1",
+            id="decision-1",
+            summary="adopted",
+        )
+        manager.reject.return_value = mock.Mock(
+            target_type="run",
+            target_id="target-2",
+            id="decision-2",
+            summary="rejected",
+        )
+
+        with mock.patch("khan_core.cli.AdoptionManager", return_value=manager):
+            adopt = CliRunner().invoke(app, ["adopt", "target-1"])
+            reject = CliRunner().invoke(app, ["reject", "target-2"])
+
+        self.assertEqual(adopt.exit_code, 0, adopt.output)
+        self.assertIn("Adopted run target-1 as decision decision-1", adopt.output)
+        self.assertEqual(reject.exit_code, 0, reject.output)
+        self.assertIn("Rejected run target-2 as decision decision-2", reject.output)
+        manager.adopt.assert_called_once_with(
+            "target-1",
+            provider=None,
+            force=False,
+            cleanup=False,
+            validate=False,
+            commit=False,
+            commit_message=None,
+        )
+        manager.reject.assert_called_once_with("target-2", provider=None, cleanup=True)
+
+    def test_run_watch_alias_follows_terminal_run(self) -> None:
+        config = ConfigFile()
+        config.global_config.state_dir = self.root / "state"
+        store = Store(config.global_config.state_dir)
+        task = store.create_task("p", "title", "prompt", "success", None)
+        run = store.create_run(task.id, "p", str(self.root))
+        store.update_run(run.id, "succeeded", "finished")
+
+        with mock.patch("khan_core.cli.load_config", return_value=config):
+            result = CliRunner().invoke(app, ["run", "watch", run.id])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(run.id, result.output)
+        self.assertIn("succeeded", result.output)
+
+    def test_completion_command_emits_a_shell_script(self) -> None:
+        result = CliRunner().invoke(app, ["completion", "bash"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("_khan_completion", result.output)
+        self.assertIn("complete -o default", result.output)
+
+    def test_codex_exec_command_uses_khan_codex_model_defaults(self) -> None:
+        project = ProjectConfig(name="p", path=self.root, workspace_mode="in_place")
+        schema = self.root / "schema.json"
+        schema.write_text("{}")
+        output = self.root / "last-message.json"
+        output.write_text(
+            json.dumps(
+                {
+                    "status": "done",
+                    "summary": "done",
+                    "changed_files": [],
+                    "tests_run": [],
+                    "open_risks": [],
+                    "next_action": "",
+                }
+            )
+        )
+
+        class FakeSelector:
+            def register(self, *args, **kwargs):
+                return None
+
+            def select(self, timeout=None):
+                return []
+
+            def unregister(self, *args, **kwargs):
+                return None
+
+            def close(self):
+                return None
+
+        class FakeProcess:
+            pid = 1234
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO()
+                self.stderr = io.StringIO()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        with (
+            mock.patch("khan_core.codex_cli.subprocess.Popen", return_value=FakeProcess()) as popen,
+            mock.patch("khan_core.codex_cli.selectors.DefaultSelector", return_value=FakeSelector()),
+        ):
+            result, events = CodexCLI(str(self.fake)).exec_task(self.root, "prompt", schema, output, project)
+
+        argv = popen.call_args.args[0]
+        self.assertNotIn("-a", argv)
+        self.assertIn("-s", argv)
+        self.assertIn("-m", argv)
+        self.assertIn("gpt-5.4-mini", argv)
+        self.assertIn("-c", argv)
+        self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertEqual(result.summary, "done")
+        self.assertEqual(events, [])
+
+    def test_codex_agent_adapter_uses_khan_codex_model_defaults(self) -> None:
+        config = ConfigFile()
+        config.global_config.state_dir = self.root / "state"
+        store = Store(config.global_config.state_dir)
+        project = ProjectConfig(name="p", path=self.root, workspace_mode="in_place")
+        command = CodexAgentAdapter().build_command(
+            config=config,
+            project=project,
+            store=store,
+            workspace=self.root,
+            prompt="prompt",
+            session_id="session-1",
+        )
+        self.assertNotIn("-a", command.argv)
+        self.assertIn("-s", command.argv)
+        self.assertIn("-m", command.argv)
+        self.assertIn("gpt-5.4-mini", command.argv)
+        self.assertIn("-c", command.argv)
+        self.assertIn('model_reasoning_effort="high"', command.argv)
+
+    def test_ask_prefers_path_like_targets_over_project_name_collisions(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        (repo / "khan").write_text("launcher\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        state = self.root / "state"
+        config_path = self.root / "config.yaml"
+        config_path.write_text(
+            f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+adoption:
+  retention_days: 7
+daemon:
+  stale_heartbeat_seconds: 900
+  restart_on_crash: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  .:
+    name: .
+    path: {repo / 'khan'}
+    workspace_mode: in_place
+  khan:
+    name: khan
+    path: {repo}
+    workspace_mode: in_place
+"""
+        )
+
+        from khan_core.ask import AskRunner
+
+        old_cwd = Path.cwd()
+        try:
+            os.chdir(repo)
+            outcome = AskRunner(config_path).ask(".", "What is this project about?", enqueue=True)
+        finally:
+            os.chdir(old_cwd)
+
+        self.assertEqual(outcome.task.project, "khan")
+        self.assertNotEqual(outcome.task.project, ".")
 
     def test_agent_session_store_lifecycle(self) -> None:
         store = Store(self.root / "state")
@@ -326,17 +585,21 @@ projects:
         )
         cross_review = store.create_cross_review(duel.id)
         store.update_cross_review(cross_review.id, "awaiting_decision", "review complete")
+        pipeline = store.create_pipeline(task.id, "p", "prompt", builder_providers=["codex", "cursor-agent"])
+        store.update_pipeline(pipeline.id, "awaiting_decision", "Recommend `codex` with high confidence.", recommended_provider="codex")
 
         router = AttentionRouter(store)
         cards = router.cards()
         self.assertEqual(cards[0].classification, "decision_required")
         self.assertEqual(cards[0].subject_type, "run")
+        self.assertTrue(any(card.subject_type == "pipeline" for card in cards))
         metrics = router.metrics()
         self.assertEqual(metrics["runs"]["needs_human"], 1)
         self.assertEqual(metrics["sessions"]["active"], 1)
         self.assertEqual(metrics["queue"]["queued"], 1)
         self.assertEqual(metrics["daemons"]["running"], 1)
         self.assertEqual(metrics["duels"]["awaiting_decision"], 1)
+        self.assertEqual(metrics["pipelines"]["awaiting_decision"], 1)
         self.assertEqual(metrics["adoptions"]["adopted"], 1)
         self.assertEqual(metrics["cross_reviews"]["awaiting_decision"], 1)
         self.assertTrue(any(card.subject_type == "queue" and card.run_id == item.id for card in cards))
@@ -427,6 +690,69 @@ projects: {{}}
         finally:
             stopped = supervisor.stop(daemon.id)
         self.assertIn(stopped.status, {"stopping", "stopped"})
+
+    def test_daemon_marks_stale_heartbeat_failed(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+daemon:
+  stale_heartbeat_seconds: 1
+  restart_on_crash: false
+notifications:
+  input_needed: false
+projects: {{}}
+""")
+        store = Store(state)
+        daemon = store.create_daemon(123, ["khan", "daemon", "run"], 0.1, 60.0, daemon_id="daemon-1")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_processes SET heartbeat_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", daemon.id),
+            )
+        supervisor = DaemonSupervisor(config)
+        statuses = supervisor.status()
+        self.assertEqual(statuses[0].status, "failed")
+        self.assertIn("Heartbeat is stale", statuses[0].error)
+
+    def test_daemon_restart_policy_recreates_failed_record(self) -> None:
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+daemon:
+  stale_heartbeat_seconds: 1
+  restart_on_crash: true
+notifications:
+  input_needed: false
+projects: {{}}
+""")
+        store = Store(state)
+        daemon = store.create_daemon(
+            123,
+            ["khan", "daemon", "run", "--daemon-id", "daemon-1"],
+            0.1,
+            60.0,
+            daemon_id="daemon-1",
+        )
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE daemon_processes SET heartbeat_at=? WHERE id=?",
+                ("2000-01-01T00:00:00+00:00", daemon.id),
+            )
+        supervisor = DaemonSupervisor(config)
+        fake_process = mock.Mock(pid=4567)
+        with mock.patch("khan_core.daemon.subprocess.Popen", return_value=fake_process):
+            statuses = supervisor.status()
+        self.assertEqual(len(statuses), 2)
+        self.assertTrue(any(record.status == "running" and record.pid == 4567 for record in statuses))
+        self.assertTrue(any(record.id == daemon.id and record.status == "failed" for record in statuses))
 
     def test_queue_worker_processes_session_items(self) -> None:
         state = self.root / "state"
@@ -680,6 +1006,153 @@ projects:
         self.assertEqual(manager.store.get_duel_participant(duel.id, "cursor-agent").status, "rejected")
         self.assertEqual(manager.store.get_duel(duel.id).status, "adopted")
 
+    def test_adopt_preview_shows_dirty_state_and_protected_paths(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "Makefile").write_text("test:\n\ttrue\n")
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        (repo / "dirty.txt").write_text("dirty\n")
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+adoption:
+  retention_days: 0
+projects:
+  p:
+    name: p
+    path: {repo}
+    default_branch: main
+    workspace_mode: worktree
+    validate_commands:
+      - make test
+    protected_paths:
+      - docs
+    env:
+      FAKE_CHANGE: docs/adopt.txt
+""")
+        run_result = CliRunner().invoke(
+            app,
+            ["ask", "p", "Prepare adoption preview.", "--mode", "single", "--config", str(config)],
+        )
+        self.assertEqual(run_result.exit_code, 0, run_result.output)
+        store = Store(state)
+        run = store.list_runs()[0]
+
+        with mock.patch("typer.confirm", return_value=True):
+            adopt = CliRunner().invoke(
+                app,
+                [
+                    "adopt",
+                    run.id,
+                    "--preview",
+                    "--force",
+                    "--validate",
+                    "--config",
+                    str(config),
+                ],
+            )
+        self.assertEqual(adopt.exit_code, 0, adopt.output)
+        self.assertIn("Adoption Preview", adopt.output)
+        self.assertIn("Destination dirty: yes", adopt.output)
+        self.assertIn("docs/adopt.txt", adopt.output)
+        self.assertIn("Protected Paths", adopt.output)
+        self.assertEqual((repo / "docs" / "adopt.txt").read_text(), "changed\n")
+
+    def test_adoption_retention_prunes_expired_worktrees(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+adoption:
+  retention_days: 0
+projects:
+  p:
+    name: p
+    path: {repo}
+    default_branch: main
+    workspace_mode: worktree
+    env:
+      FAKE_CHANGE: docs/retained.txt
+""")
+        result = CliRunner().invoke(app, ["ask", "p", "Create retained worktree.", "--mode", "single", "--config", str(config)])
+        self.assertEqual(result.exit_code, 0, result.output)
+        store = Store(state)
+        run = store.list_runs()[0]
+        manager = AdoptionManager(config)
+        adopted = manager.adopt(run.id, cleanup=False)
+        retained_workspace = Path(adopted.source_workspace)
+        self.assertTrue(retained_workspace.exists())
+        cleaned = manager.prune_retained_worktrees()
+        self.assertGreaterEqual(cleaned, 1)
+        self.assertFalse(retained_workspace.exists())
+
+    def test_adopt_can_validate_and_commit(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+projects:
+  p:
+    name: p
+    path: {repo}
+    default_branch: main
+    workspace_mode: worktree
+    validate_commands:
+      - test -f docs/adopt.txt
+    env:
+      FAKE_CHANGE: docs/adopt.txt
+""")
+        engine = LoopEngine(config)
+        task = engine.store.create_task("p", "title", "prompt", "success", None)
+        run_id = engine.run_task(task.id)
+        manager = AdoptionManager(config)
+        adopted = manager.adopt(run_id, validate=True, commit=True, commit_message="Adopt run")
+        self.assertEqual(adopted.status, "adopted")
+        self.assertEqual((repo / "docs" / "adopt.txt").read_text(), "changed\n")
+        commit = subprocess.run(["git", "log", "--format=%s", "-1"], cwd=repo, text=True, capture_output=True, check=True)
+        self.assertEqual(commit.stdout.strip(), "Adopt run")
+
     def test_duel_cli_run_path_form_auto_discovers_project(self) -> None:
         repo = self.root / "repo"
         repo.mkdir()
@@ -711,7 +1184,7 @@ projects: {{}}
         duel = store.list_duels()[0]
         self.assertEqual(duel.status, "awaiting_decision")
 
-    def test_ask_cli_auto_discovers_project_and_runs_task(self) -> None:
+    def test_ask_cli_single_mode_auto_discovers_project_and_runs_task(self) -> None:
         repo = self.root / "repo"
         repo.mkdir()
         subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -740,11 +1213,12 @@ projects: {{}}
 """)
         result = CliRunner().invoke(
             app,
-            ["ask", str(repo), "Implement a broad local task.", "--config", str(config)],
+            ["ask", str(repo), "Implement a broad local task.", "--mode", "single", "--config", str(config)],
             env={"FAKE_CHANGE": "docs/ask.txt"},
         )
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("finished with status succeeded", result.output)
+        self.assertIn("Evidence Ledger", result.output)
         loaded = load_config(config)
         self.assertEqual(len(loaded.projects), 1)
         project = next(iter(loaded.projects.values()))
@@ -784,12 +1258,215 @@ projects: {{}}
             ["ask", str(repo), "Queue this local task.", "--enqueue", "--priority", "5", "--config", str(config)],
         )
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("queued item", result.output)
+        self.assertIn("queued pipeline item", result.output)
         store = Store(state)
         items = store.list_queue_items()
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].kind, "task")
+        self.assertEqual(items[0].kind, "pipeline")
+        self.assertEqual(items[0].payload["task_id"], store.list_tasks()[0].id)
         self.assertEqual(items[0].priority, 5)
+
+    def test_ask_cli_default_mode_runs_pipeline(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "Makefile").write_text("test:\n\ttrue\n")
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 4
+notifications:
+  input_needed: false
+projects: {{}}
+""")
+        result = CliRunner().invoke(
+            app,
+            ["ask", str(repo), "Plan this with a pipeline.", "--config", str(config)],
+            env={"FAKE_CHANGE": "docs/codex.txt", "FAKE_CURSOR_CHANGE": "docs/cursor.txt"},
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("pipeline", result.output.lower())
+        self.assertIn("Evidence Ledger", result.output)
+        self.assertIn("decision-card.md", result.output)
+        store = Store(state)
+        self.assertEqual(len(store.list_tasks()), 1)
+        self.assertEqual(len(store.list_pipelines()), 1)
+        self.assertEqual(len(store.list_duels()), 1)
+
+    def test_inspection_commands_render_last_summary_diff_and_explain(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 3
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects: {{}}
+""")
+        result = CliRunner().invoke(
+            app,
+            ["ask", str(repo), "Inspect this run.", "--mode", "single", "--config", str(config)],
+            env={"FAKE_CHANGE": "docs/inspect.txt"},
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        store = Store(state)
+        run = store.list_runs()[0]
+
+        last = CliRunner().invoke(app, ["last", "--kind", "run", "--config", str(config)])
+        self.assertEqual(last.exit_code, 0, last.output)
+        self.assertIn(run.id[:8], last.output)
+
+        summary = CliRunner().invoke(app, ["summary", run.id, "--config", str(config)])
+        self.assertEqual(summary.exit_code, 0, summary.output)
+        self.assertIn("## Record", summary.output)
+        self.assertIn(run.id, summary.output)
+
+        show = CliRunner().invoke(app, ["show", run.id, "--config", str(config)])
+        self.assertEqual(show.exit_code, 0, show.output)
+        self.assertIn("Evidence Ledger", show.output)
+
+        diff = CliRunner().invoke(app, ["diff", run.id, "--config", str(config)])
+        self.assertEqual(diff.exit_code, 0, diff.output)
+        self.assertIn("docs/inspect.txt", diff.output)
+
+        explain = CliRunner().invoke(app, ["explain", run.id, "--json", "--config", str(config)])
+        self.assertEqual(explain.exit_code, 0, explain.output)
+        self.assertIn(run.id, explain.output)
+        self.assertIn("workspace", explain.output)
+
+    def test_relay_and_steer_create_continuation_sessions(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 4
+notifications:
+  input_needed: false
+projects:
+  p:
+    name: p
+    path: {repo}
+    workspace_mode: in_place
+""")
+        relay = CliRunner().invoke(app, ["relay", str(repo), "Implement via relay.", "--preset", "codex-plan cursor-build", "--config", str(config)])
+        self.assertEqual(relay.exit_code, 0, relay.output)
+        self.assertIn("Relay finished", relay.output)
+        store = Store(state)
+        sessions = sorted(store.list_agent_sessions(), key=lambda session: session.created_at)
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sessions[1].parent_session_id, sessions[0].id)
+        self.assertIn("relay-preset.md", [path.name for path in store.list_artifacts(sessions[0].id)])
+
+        start = CliRunner().invoke(
+            app,
+            ["session", "start", "cursor-agent", "p", "--prompt", "Start here.", "--config", str(config)],
+        )
+        self.assertEqual(start.exit_code, 0, start.output)
+        session = sorted(store.list_agent_sessions(), key=lambda item: item.created_at)[-1]
+        steer = CliRunner().invoke(app, ["steer", session.id, "Continue from here.", "--config", str(config)])
+        self.assertEqual(steer.exit_code, 0, steer.output)
+        sessions = sorted(store.list_agent_sessions(), key=lambda item: item.created_at)
+        self.assertEqual(len(sessions), 4)
+        self.assertEqual(sessions[-1].parent_session_id, session.id)
+
+    def test_replay_and_bench_reuse_existing_run_context(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "base.txt").write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 4
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects: {{}}
+""")
+        result = CliRunner().invoke(
+            app,
+            ["ask", str(repo), "Create a replayable run.", "--mode", "single", "--config", str(config)],
+            env={"FAKE_CHANGE": "docs/original.txt"},
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        store = Store(state)
+        run = store.list_runs()[0]
+
+        codex = CliRunner().invoke(
+            app,
+            ["replay", run.id, "--provider", "codex", "--config", str(config)],
+            env={"FAKE_CHANGE": "docs/replay.txt"},
+        )
+        self.assertEqual(codex.exit_code, 0, codex.output)
+        self.assertIn("Replay", codex.output)
+
+        cursor = CliRunner().invoke(
+            app,
+            ["replay", run.id, "--provider", "cursor-agent", "--config", str(config)],
+            env={"FAKE_CURSOR_CHANGE": "docs/cursor-replay.txt"},
+        )
+        self.assertEqual(cursor.exit_code, 0, cursor.output)
+        self.assertIn("cursor-agent", cursor.output)
+
+        bench_file = self.root / "bench.yaml"
+        bench_file.write_text(
+            f"""runs:
+  - target: {run.id}
+    prompt: Replay benchmark.
+    provider: codex
+"""
+        )
+        bench = CliRunner().invoke(app, ["bench", str(bench_file), "--config", str(config)], env={"FAKE_CHANGE": "docs/bench.txt"})
+        self.assertEqual(bench.exit_code, 0, bench.output)
+        self.assertIn("Bench completed", bench.output)
+        bench_report = next((state / "runs").rglob("bench-report.md"))
+        self.assertIn("Score", bench_report.read_text())
 
     def test_custom_agent_adapter_can_be_registered(self) -> None:
         class FakeAgentAdapter(JsonlAgentAdapter):
@@ -830,7 +1507,70 @@ projects:
         session = runner.store.get_agent_session(session_id)
         self.assertEqual(session.provider, "fake-agent")
         self.assertEqual(session.external_id, "custom-session")
-        self.assertEqual(session.summary, "custom done")
+
+    def test_native_steering_uses_external_session_ids_when_available(self) -> None:
+        class SteeringAgentAdapter(JsonlAgentAdapter):
+            name = "steering-agent"
+
+            def supports_steering(self) -> bool:
+                return True
+
+            def build_command(self, **kwargs) -> AgentCommand:
+                return AgentCommand(
+                    argv=[
+                        sys.executable,
+                        "-c",
+                        "import json; print(json.dumps({'chat_id': 'build-session', 'text': 'build'}))",
+                    ]
+                )
+
+            def resume_command(self, **kwargs) -> AgentCommand | None:
+                return AgentCommand(
+                    argv=[
+                        sys.executable,
+                        "-c",
+                        "import json; print(json.dumps({'chat_id': 'resume-session', 'text': 'resume'}))",
+                    ]
+                )
+
+        state = self.root / "state"
+        config = self.root / "config.yaml"
+        config.write_text(f"""global:
+  codex_bin: {self.fake}
+  cursor_agent_bin: {self.fake_cursor}
+  state_dir: {state}
+  max_concurrent_runs: 2
+notifications:
+  input_needed: false
+profiles:
+  default:
+    max_iterations: 1
+    auto_review: false
+projects:
+  p:
+    name: p
+    path: {self.root}
+    workspace_mode: in_place
+""")
+        registry = AgentAdapterRegistry()
+        registry.register(SteeringAgentAdapter())
+        runner = AgentSessionRunner(config, registry=registry)
+        initial_session_id = runner.start_session("steering-agent", "p", "initial prompt")
+        initial_session = runner.store.get_agent_session(initial_session_id)
+        steered_session_id = runner.start_session(
+            "steering-agent",
+            "p",
+            "continuation prompt",
+            workspace=Path(initial_session.workspace),
+            parent_session_id=initial_session.id,
+            resume_external_session_id=initial_session.external_id,
+            resume_message="Continue this work.",
+        )
+        steered_session = runner.store.get_agent_session(steered_session_id)
+        self.assertEqual(initial_session.external_id, "build-session")
+        self.assertEqual(steered_session.parent_session_id, initial_session.id)
+        self.assertEqual(steered_session.external_id, "resume-session")
+        self.assertEqual(steered_session.summary, "resume")
 
 
 if __name__ == "__main__":

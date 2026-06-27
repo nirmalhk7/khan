@@ -1,60 +1,64 @@
 # Khan
 
-> "Superior ability breeds superior ambition."  
-> "He tasks me."  
-> "I shall leave you as you left me."
+Khan is a local multi-agent decision system for software engineering work.
 
-Khan is a local-first control plane for coding agents. It records projects,
-tasks, runs, direct agent sessions, logs, artifacts, process IDs, workspaces,
-human-input stops, and adapter events in SQLite so Codex and Cursor Agent can be
-orchestrated and inspected from one place.
+It turns a broad prompt into a tracked, inspectable pipeline: Codex writes an
+implementation brief, Codex and Cursor Agent build independently in isolated
+worktrees, completed candidates are cross-reviewed, and Khan produces a decision
+card with evidence and explicit adopt/reject commands. Khan never auto-adopts
+changes into your checkout.
 
-The name is a nod to Khan Noonien Singh from Star Trek: an intentionally
-overpowered operator for work that should be coordinated better than one human
-terminal session at a time.
+## Why Khan Exists
+
+AI coding work becomes hard to trust when it lives only in terminal scrollback.
+Khan gives that work durable structure:
+
+- SQLite-backed records for tasks, pipelines, sessions, duels, reviews, queues,
+  artifacts, and adoption decisions.
+- Pipeline-first `khan ask` flow for planning, parallel implementation,
+  cross-review, and human approval.
+- Provider-neutral sessions for Codex, Cursor Agent, and custom adapters.
+- Manual adoption and rejection so generated changes enter your working tree
+  only when you choose.
+- Operator views through `khan inbox`, `khan show`, `khan get`, metrics, and a
+  terminal UI.
 
 ## Status
 
-Khan is early FOSS infrastructure. It is usable as a local CLI today, but richer
-TUI, same-session steering, replay/benchmark workflows, crash restart policy,
-and deeper multi-agent topologies are still being built.
+Khan is early FOSS infrastructure. It is usable for local workflows today, but
+the public API, CLI shape, and storage schema may still evolve.
 
-Currently implemented:
+Implemented today:
 
-- Durable Codex task loop with validation, optional review, retries, run logs,
-  artifacts, process heartbeats, pause/resume/cancel, and protected-path stops.
-- Persisted task capsules with acceptance criteria, allowed paths, protected
-  paths, verification recipes, blast radius, dependencies, and conflict domains.
-- Zero-friction `khan ask <project-or-path> "prompt"` task intake with local git
-  project auto-discovery, validation inference, immediate run, and enqueue mode.
-- Conflict-domain scheduling guardrails for active runs.
-- Durable queue items for task runs and agent sessions, foreground workers,
-  detached daemon start/status/stop, stale lease recovery, and last-item
-  tracking.
-- Provider-neutral session registry for headless agents.
-- Built-in agent adapters for `codex` and `cursor-agent`.
-- Adapter registry for third-party agents.
-- Provider duel records that run Codex and Cursor Agent against the same prompt
-  in isolated worktrees, then write side-by-side evidence reports.
-- Cross-review records where each duel provider reviews the other provider's
-  diff through the same adapter/session layer.
-- Manual adopt/reject decisions for run, session, and duel workspaces with dirty
-  destination refusal, optional cleanup, and durable decision records.
-- Attention router and metrics commands for operator visibility.
-- Textual TUI scaffold showing projects, task runs, and agent sessions.
-- macOS `say` notification when a task run enters `needs_human`.
-- Unit tests using fake Codex, Cursor Agent, and `say` binaries.
+- Project registration and local git repository discovery.
+- Pipeline mode, single-agent mode, and queue mode for `khan ask`.
+- Task capsules with validation commands, allowed paths, protected paths, and
+  conflict domains.
+- Codex and Cursor Agent adapters.
+- Provider duels, cross-reviews, reports, and decision cards.
+- Manual `adopt` and `reject` workflows with dirty-destination checks.
+- Durable queue worker, daemon supervisor, metrics, and TUI.
 
-## Install
+## Requirements
+
+- Python 3.12 or newer is recommended.
+- `git`
+- `codex` for Codex-backed runs.
+- `cursor-agent` for Cursor Agent-backed runs.
+
+The test suite uses fake provider binaries, so Codex and Cursor Agent are not
+required just to run tests.
+
+## Installation
 
 ```bash
 make setup
 ```
 
-This creates `.venv`, installs dependencies, installs `khan` into
-`~/.local/bin`, initializes state, and runs doctor checks.
+This creates `.venv`, installs dependencies from `requirements.txt`, links the
+`khan` launcher into `~/.local/bin`, initializes state, and runs `khan doctor`.
 
-Override paths if needed:
+Override paths when needed:
 
 ```bash
 make setup PYTHON=python3.12 INSTALL_DIR="$HOME/.local/bin"
@@ -66,231 +70,152 @@ Run tests:
 make test
 ```
 
-## Quickstart
+## Quick Start
+
+Initialize Khan and check the environment:
 
 ```bash
 khan init
 khan doctor
-khan project add khan /Users/nirmalhk7/Documents/DevWorld/khan
-khan project list
 ```
 
-Run a broad local task without pre-registering the repo:
+Run the default multi-agent pipeline against the current repository:
 
 ```bash
-khan ask . "Update the docs for the current orchestration features."
-khan ask . "Queue this for later validation." --enqueue
+khan ask . "Implement the feature and run the inferred checks."
 ```
 
-Create a durable Codex task with a capsule:
+Inspect actionable records:
 
 ```bash
-khan task create khan \
-  --title "Improve docs" \
-  --prompt "Update documentation for the current agent orchestration features." \
-  --success "README and docs describe setup, sessions, adapters, and operations." \
-  --accept "Docs are accurate for the current CLI." \
-  --allowed-path README.md \
-  --allowed-path docs \
-  --verify "make test" \
-  --conflict-domain docs
+khan inbox
+khan show <pipeline-id>
 ```
 
-Run and inspect it:
+Adopt or reject explicitly:
 
 ```bash
-khan list-tasks
-khan task capsule <task-id>
-khan task run <task-id>
-khan task enqueue <task-id>
+khan adopt <pipeline-id> --provider codex
+khan reject <pipeline-id> --provider cursor-agent
+```
+
+Queue a pipeline for a worker:
+
+```bash
+khan ask . "Update the docs." --mode queue
 khan queue work --once
-khan daemon start
-khan daemon status
-khan watch <run-id>
-khan attention
-khan metrics
 ```
 
-Start one-shot provider-neutral agent sessions:
+Use the original one-agent Codex task loop:
 
 ```bash
-khan session providers
-khan session start codex khan --prompt "Inspect this repo and summarize the architecture."
-khan session start cursor-agent khan --prompt "Inspect this repo and summarize the architecture."
-khan session enqueue cursor-agent khan --prompt "Inspect this repo and summarize the architecture."
-khan queue list
-khan session list
-khan session logs <session-id>
+khan ask . "Make the small targeted change." --mode single
 ```
 
-Run a provider duel and inspect the evidence:
+## Common Commands
 
 ```bash
-khan duel run khan "Implement the feature in the safest way you can."
-khan duel show <duel-id>
-khan duel artifacts <duel-id>
+khan inbox                         # actionable decision cards
+khan show <id>                     # human-readable evidence view
+khan get pipelines                 # pipeline records
+khan get runs                      # task-loop runs
+khan get sessions                  # provider sessions
+khan diff <id>                     # recorded workspace diff when available
+khan metrics                       # orchestration metrics
+khan tui                           # terminal operator UI
+```
+
+Advanced workflows:
+
+```bash
+khan duel run . "Try two implementations."
 khan cross-review <duel-id>
-khan cross-review-show <cross-review-id>
-khan adopt <duel-id> --provider codex
-khan reject <duel-id> --provider cursor-agent
-khan adoption list
-```
-
-Control task runs:
-
-```bash
-khan run status <run-id>
-khan run logs <run-id>
-khan run artifacts <run-id>
-khan run pause <run-id>
-khan run resume <run-id>
-khan run cancel <run-id>
-```
-
-Open the operator console scaffold:
-
-```bash
-khan tui
+khan session start cursor-agent . --prompt "Inspect this repo."
+khan replay <run-id> --provider codex
+khan relay . "Plan with Codex, build with Cursor." --preset "codex-plan cursor-build"
 ```
 
 ## Configuration
 
-Default config is written to `~/.khan/config.yaml`, or to repo-local
-`.khan/config.yaml` when the home directory is not writable.
-
-Set `KHAN_HOME` to force a state directory:
+Khan writes configuration to `~/.khan/config.yaml` by default. Set `KHAN_HOME`
+to use another state directory.
 
 ```bash
 KHAN_HOME=/tmp/khan-state khan init
 ```
 
-Example:
+See:
 
-```yaml
-global:
-  codex_bin: codex
-  cursor_agent_bin: cursor-agent
-  state_dir: ~/.khan
-  default_profile: default
-  max_concurrent_runs: 3
-notifications:
-  input_needed: true
-  say_bin: say
-  phrase: Khan needs your input.
-profiles:
-  default:
-    max_iterations: 4
-    max_review_rounds: 2
-    max_validation_retries: 2
-    max_runtime_minutes: 45
-    idle_timeout_minutes: 10
-    checkpoint_before_run: true
-    checkpoint_on_success: false
-    auto_review: true
-projects: {}
-prompts: {}
+- `docs/configuration.md` for config fields and project policy.
+- `docs/cli.md` for command reference.
+- `docs/operations.md` for day-to-day operations.
+- `docs/agent-adapters.md` for custom provider adapters.
+- `docs/overview.md` for architecture notes.
+
+## Project Layout
+
+```text
+khan                  CLI launcher
+src/khan_core/        orchestration, storage, adapters, CLI, TUI
+src/khan/             compatibility package
+tests/                unittest-based test suite with fake providers
+docs/                 user and operator documentation
+deploy/               launchd and systemd examples
 ```
 
-When a task run enters `needs_human`, Khan calls `say` with the configured
-phrase and run summary if `notifications.input_needed` is enabled and the binary
-is available. Notification failures are recorded and do not fail the run.
+## Development
 
-## Architecture
+Set up the local environment:
 
-Khan has three execution concepts.
+```bash
+make setup
+```
 
-Task runs are durable Codex loops. A task has a title, objective, success
-criteria, profile, and persisted capsule. A run invokes Codex, captures JSONL
-output, detects changed files from git, enforces capsule guardrails, runs
-validation commands, optionally runs Codex review, and either succeeds, retries,
-fails, or stops for human input.
-
-`khan ask` is the shortest path into that same machinery: it accepts a
-configured project name or local git path, creates a project config when needed,
-infers validation commands, writes a task capsule, and either runs immediately
-or queues the task.
-
-Agent sessions are provider-neutral one-shot headless executions. A session uses
-an adapter to build a command, parse stdout/stderr events, extract an external
-session ID where possible, and summarize final state. The same session store
-works for Codex, Cursor Agent, and custom adapters.
-
-Duels are parent orchestration records that launch multiple provider-neutral
-sessions against the same task in isolated git worktrees. Khan captures each
-participant's transcript, changed files, diff stat, validation result, runtime,
-summary, risks, and a generated `duel-report.md` for operator comparison.
-
-The current orchestration direction intentionally follows the practical shape of
-modern agent-first workflows: local control and extensibility inspired by Peter
-Steinberger's OpenClaw work, many observable concurrent sessions and loops
-popularized by Boris Cherny's Claude Code usage, and an agent cockpit where the
-human compares outputs instead of manually juggling terminal tabs.
-
-Important implementation areas:
-
-- CLI command surface.
-- Zero-friction ask intake for broad local tasks.
-- Codex task loop.
-- Provider-neutral session runner.
-- Agent adapter protocol and built-ins.
-- Provider duel runner and evidence reports.
-- Cross-review runner and critique artifacts.
-- Adopt/reject workflow for applying selected agent work.
-- Durable queue, foreground worker, and detached daemon supervisor.
-- Attention cards and metrics.
-- SQLite migrations and persistence.
-- Textual operator console scaffold.
-
-## Agent Adapters
-
-Built-ins:
-
-- `CodexAgentAdapter` runs `codex exec --json`.
-- `CursorAgentAdapter` runs `cursor-agent --print --output-format stream-json`.
-
-To add another provider, implement the `AgentAdapter` protocol and register it
-with `register_agent_adapter(...)`. The runner handles persistence, workspaces,
-process groups, cancellation, stdout/stderr event capture, and status updates.
-
-## Docs
-
-- [Overview](docs/overview.md)
-- [CLI](docs/cli.md)
-- [Configuration](docs/configuration.md)
-- [Agent Adapters](docs/agent-adapters.md)
-- [Operations](docs/operations.md)
-
-## Current Limits
-
-- The task loop still uses Codex as its worker/reviewer engine.
-- Agent sessions are headless one-shot sessions; same-session steering is not
-  implemented yet.
-- Duels, cross-review, and manual adopt/reject are implemented, but replay and
-  benchmark workflows are still roadmap items.
-- The TUI is an operator-console scaffold, not a full interactive platform.
-- Detached daemon crash restart policy and daemon log tailing are not complete.
-- No Python packaging metadata yet.
-
-## Contributing
-
-Keep provider-specific behavior in adapters. Keep orchestration state in the
-store. Add tests with fake binaries rather than calling real external agents.
-
-Before sending changes:
+Run the full test suite before sending changes:
 
 ```bash
 make test
 ```
 
-## License
+Guidelines:
 
-No license file is present yet. Add one before distributing Khan as a public
-FOSS project.
+- Keep changes scoped and prefer existing patterns in `src/khan_core`.
+- Add or update tests in `tests/test_foundation.py` for user-visible behavior,
+  storage migrations, and orchestration changes.
+- Do not silently adopt generated changes; Khan's product contract is explicit
+  human approval.
+- Preserve existing worktree changes unless you intentionally own them.
 
-## Legacy Entrypoint
+## Contributing
 
-The CLI wrapper is `khan`. The internal Python entrypoint remains:
+Issues, bug reports, design notes, and pull requests are welcome. Good reports
+include:
+
+- Khan version or commit.
+- Operating system.
+- Command run.
+- Relevant config snippet with secrets removed.
+- Expected behavior and actual behavior.
+- `khan show <id>` or artifact paths when available.
+
+Before submitting a pull request, run:
 
 ```bash
-python scripts/khan_cli.py ...
+make test
 ```
+
+## Security
+
+Khan runs local agent processes that can edit files inside configured
+workspaces. Review generated diffs before adoption, keep secrets out of prompts
+and artifacts, and use project `protected_paths` for sensitive files.
+
+If you find a security issue, do not include secrets or exploit details in a
+public issue. Open a minimal report first so maintainers can coordinate a safe
+disclosure path.
+
+## License
+
+No license file is currently included in this repository. Until a license is
+added, the default copyright restrictions apply. Add a `LICENSE` file before
+redistributing or packaging Khan as open source.

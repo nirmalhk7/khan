@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import load_config
 from .models import AdoptionRecord, AgentProvider, ProjectConfig
 from .store import Store
+from .validator import Validator
 from .worktree import WorktreeManager
 
 
@@ -32,6 +34,23 @@ class AdoptionTarget:
     session_id: str | None = None
 
 
+@dataclass(frozen=True)
+class AdoptionPreview:
+    target_type: str
+    target_id: str
+    provider: AgentProvider | None
+    project: str
+    source_workspace: Path
+    destination_workspace: Path
+    changed_files: list[str]
+    protected_files: list[str]
+    dirty_destination: bool
+    validation_commands: list[str]
+    will_validate: bool
+    cleanup: bool
+    retention_days: int
+
+
 class AdoptionManager:
     def __init__(self, config_path: Path | None = None) -> None:
         self.config_path = config_path
@@ -39,7 +58,18 @@ class AdoptionManager:
         self.store = Store(self.config.global_config.state_dir)
         self.worktrees = WorktreeManager(self.config.global_config.state_dir)
 
-    def adopt(self, target_id: str, *, provider: AgentProvider | None = None, force: bool = False, cleanup: bool = False) -> AdoptionRecord:
+    def adopt(
+        self,
+        target_id: str,
+        *,
+        provider: AgentProvider | None = None,
+        force: bool = False,
+        cleanup: bool = False,
+        validate: bool = False,
+        commit: bool = False,
+        commit_message: str | None = None,
+    ) -> AdoptionRecord:
+        self.prune_retained_worktrees()
         target = self._resolve_target(target_id, provider)
         destination = target.project.path
         changes = self._changed_entries(target.source_workspace)
@@ -53,9 +83,15 @@ class AdoptionManager:
             if dirty and not force:
                 raise AdoptionError("Destination worktree is dirty; commit/stash changes or retry with --force.")
             self._apply_changes(target.source_workspace, destination, changes)
+            if validate:
+                validation = Validator().run(destination, target.project.validate_commands)
+                if not validation.ok:
+                    raise AdoptionError(validation.summary)
+            if commit:
+                self._commit(destination, commit_message or f"Adopt {target.target_type} {target.target_id[:8]}")
             if cleanup:
                 self._cleanup_source(target)
-            summary = self._summary("Adopted", changed_files, target.project)
+            summary = self._summary("Adopted", changed_files, target.project, self._decision_notes(target))
             record = self.store.create_adoption_decision(
                 target_type=target.target_type,  # type: ignore[arg-type]
                 target_id=target.target_id,
@@ -90,12 +126,13 @@ class AdoptionManager:
             raise AdoptionError(error) from exc
 
     def reject(self, target_id: str, *, provider: AgentProvider | None = None, cleanup: bool = True) -> AdoptionRecord:
+        self.prune_retained_worktrees()
         target = self._resolve_target(target_id, provider)
         changes = self._changed_entries(target.source_workspace)
         changed_files = self._changed_files(changes)
         if cleanup:
             self._cleanup_source(target)
-        summary = self._summary("Rejected", changed_files, target.project)
+        summary = self._summary("Rejected", changed_files, target.project, self._decision_notes(target))
         record = self.store.create_adoption_decision(
             target_type=target.target_type,  # type: ignore[arg-type]
             target_id=target.target_id,
@@ -111,8 +148,99 @@ class AdoptionManager:
         self._mark_target(target, "rejected", summary)
         return record
 
+    def preview(
+        self,
+        target_id: str,
+        *,
+        provider: AgentProvider | None = None,
+        validate: bool = False,
+        cleanup: bool = False,
+    ) -> AdoptionPreview:
+        target = self._resolve_target(target_id, provider)
+        changes = self._changed_entries(target.source_workspace)
+        changed_files = self._changed_files(changes)
+        protected = [
+            path
+            for path in changed_files
+            if any(
+                path == protected_path or path.startswith(f"{protected_path.rstrip('/')}/")
+                for protected_path in target.project.protected_paths
+            )
+        ]
+        dirty = bool(self._git_status(target.project.path))
+        return AdoptionPreview(
+            target_type=target.target_type,
+            target_id=target.target_id,
+            provider=target.provider,
+            project=target.project.name,
+            source_workspace=target.source_workspace,
+            destination_workspace=target.project.path,
+            changed_files=changed_files,
+            protected_files=protected,
+            dirty_destination=dirty,
+            validation_commands=list(target.project.validate_commands),
+            will_validate=validate,
+            cleanup=cleanup,
+            retention_days=self.config.adoption.retention_days,
+        )
+
+    def preview_markdown(
+        self,
+        target_id: str,
+        *,
+        provider: AgentProvider | None = None,
+        validate: bool = False,
+        cleanup: bool = False,
+    ) -> str:
+        preview = self.preview(target_id, provider=provider, validate=validate, cleanup=cleanup)
+        lines = [
+            "# Adoption Preview",
+            "",
+            f"- Target: {preview.target_type} `{preview.target_id}`",
+            f"- Provider: `{preview.provider or '-'}`",
+            f"- Project: `{preview.project}`",
+            f"- Source workspace: `{preview.source_workspace}`",
+            f"- Destination workspace: `{preview.destination_workspace}`",
+            f"- Destination dirty: {'yes' if preview.dirty_destination else 'no'}",
+            f"- Cleanup requested: {'yes' if preview.cleanup else 'no'}",
+            f"- Retention days: {preview.retention_days}",
+            f"- Validation requested: {'yes' if preview.will_validate else 'no'}",
+            "",
+            "## Changed Files",
+            "",
+        ]
+        lines.extend(f"- `{path}`" for path in preview.changed_files)
+        if not preview.changed_files:
+            lines.append("- _None recorded._")
+        lines.extend(["", "## Protected Paths", ""])
+        lines.extend(f"- `{path}`" for path in preview.protected_files)
+        if not preview.protected_files:
+            lines.append("- _None touched._")
+        lines.extend(["", "## Validation", ""])
+        lines.extend(f"- `{command}`" for command in preview.validation_commands)
+        if not preview.validation_commands:
+            lines.append("- _No validation commands configured._")
+        return "\n".join(lines) + "\n"
+
     def _resolve_target(self, target_id: str, provider: AgentProvider | None) -> AdoptionTarget:
         if provider:
+            try:
+                pipeline = self.store.get_pipeline(target_id)
+                build_phase = self.store.get_pipeline_phase(pipeline.id, "build", provider=None)
+                if build_phase is None or not build_phase.duel_id:
+                    raise AdoptionError(f"Pipeline has no adoptable build duel: {target_id}")
+                participant = self.store.get_duel_participant(build_phase.duel_id, provider)
+                project = self._project(pipeline.project)
+                return AdoptionTarget(
+                    target_type="pipeline",
+                    target_id=pipeline.id,
+                    provider=participant.provider,
+                    session_id=participant.session_id,
+                    project=project,
+                    source_workspace=Path(participant.workspace),
+                )
+            except KeyError:
+                pass
             try:
                 duel = self.store.get_duel(target_id)
                 participant = self.store.get_duel_participant(duel.id, provider)
@@ -127,6 +255,26 @@ class AdoptionManager:
                 )
             except KeyError as exc:
                 raise AdoptionError(f"Duel participant not found: {target_id}/{provider}") from exc
+
+        try:
+            pipeline = self.store.get_pipeline(target_id)
+            provider = pipeline.recommended_provider
+            if not provider:
+                raise AdoptionError("Pipeline has no recommended provider; pass --provider.")
+            build_phase = self.store.get_pipeline_phase(pipeline.id, "build", provider=None)
+            if build_phase is None or not build_phase.duel_id:
+                raise AdoptionError(f"Pipeline has no adoptable build duel: {target_id}")
+            participant = self.store.get_duel_participant(build_phase.duel_id, provider)
+            return AdoptionTarget(
+                target_type="pipeline",
+                target_id=pipeline.id,
+                provider=participant.provider,
+                session_id=participant.session_id,
+                project=self._project(pipeline.project),
+                source_workspace=Path(participant.workspace),
+            )
+        except KeyError:
+            pass
 
         try:
             duel = self.store.get_duel(target_id)
@@ -167,7 +315,7 @@ class AdoptionManager:
                 source_workspace=Path(run.workspace),
             )
         except KeyError as exc:
-            raise AdoptionError(f"No adoptable run, session, or duel found for: {target_id}") from exc
+            raise AdoptionError(f"No adoptable run, session, duel, or pipeline found for: {target_id}") from exc
 
     def _project(self, project_name: str) -> ProjectConfig:
         try:
@@ -176,6 +324,12 @@ class AdoptionManager:
             raise AdoptionError(f"Project not found in config: {project_name}") from exc
 
     def _mark_target(self, target: AdoptionTarget, status: str, summary: str) -> None:
+        if target.target_type == "pipeline":
+            if status == "adopted":
+                self.store.update_pipeline(target.target_id, "adopted", summary, recommended_provider=target.provider)
+            else:
+                self.store.update_pipeline(target.target_id, "rejected", summary, recommended_provider=target.provider)
+            return
         if target.target_type != "duel" or not target.provider:
             return
         participant = self.store.get_duel_participant(target.target_id, target.provider)
@@ -211,6 +365,32 @@ class AdoptionManager:
             return
         self.worktrees.cleanup(target.project, target.source_workspace, is_worktree=True)
 
+    def prune_retained_worktrees(self) -> int:
+        retention_days = max(self.config.adoption.retention_days, 0)
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        cleaned = 0
+        seen: set[str] = set()
+        for decision in self.store.list_adoption_decisions(limit=500):
+            if decision.status not in {"adopted", "rejected"}:
+                continue
+            if decision.created_at > cutoff:
+                continue
+            workspace = Path(decision.source_workspace)
+            if not workspace.exists():
+                continue
+            if workspace.as_posix() in seen:
+                continue
+            try:
+                project = self._project(decision.project)
+            except AdoptionError:
+                continue
+            if workspace.resolve() == project.path.resolve():
+                continue
+            self.worktrees.cleanup(project, workspace, is_worktree=True)
+            seen.add(workspace.as_posix())
+            cleaned += 1
+        return cleaned
+
     def _apply_changes(self, source: Path, destination: Path, changes: list[ChangeEntry]) -> None:
         for change in changes:
             self._ensure_safe_relative_path(change.path)
@@ -238,6 +418,18 @@ class AdoptionManager:
             shutil.rmtree(path)
         elif path.exists() or path.is_symlink():
             path.unlink()
+
+    def _commit(self, destination: Path, message: str) -> None:
+        subprocess.run(["git", "add", "-A"], cwd=destination, check=True)
+        process = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=destination,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if process.returncode != 0:
+            raise AdoptionError(process.stderr.strip() or process.stdout.strip() or "git commit failed")
 
     def _changed_entries(self, workspace: Path) -> list[ChangeEntry]:
         status = self._git_status(workspace)
@@ -275,15 +467,54 @@ class AdoptionManager:
             raise AdoptionError(process.stderr.strip() or f"Not a git workspace: {workspace}")
         return process.stdout.strip()
 
-    def _summary(self, action: str, changed_files: list[str], project: ProjectConfig) -> str:
+    def _summary(self, action: str, changed_files: list[str], project: ProjectConfig, notes: list[str] | None = None) -> str:
         protected = [
             path for path in changed_files
             if any(path == protected_path or path.startswith(f"{protected_path.rstrip('/')}/") for protected_path in project.protected_paths)
         ]
         base = f"{action} {len(changed_files)} changed file(s)."
+        notes = notes or []
         if protected:
-            return f"{base} Warning: protected paths changed: {', '.join(protected)}."
+            notes = [f"Warning: protected paths changed: {', '.join(protected)}."] + notes
+        if notes:
+            return f"{base} {' '.join(notes)}"
         return base
+
+    def _decision_notes(self, target: AdoptionTarget) -> list[str]:
+        if target.target_type == "pipeline":
+            try:
+                pipeline = self.store.get_pipeline(target.target_id)
+                reviews = [
+                    phase.cross_review_id
+                    for phase in self.store.list_pipeline_phases(pipeline.id)
+                    if phase.phase == "review" and phase.cross_review_id
+                ]
+                if reviews:
+                    critiques = self.store.list_cross_review_critiques(reviews[0])
+                    strongest = {critique.strongest_implementation for critique in critiques if critique.strongest_implementation}
+                    notes = []
+                    if len(strongest) == 1:
+                        notes.append(f"Cross-review leans toward `{next(iter(strongest))}`.")
+                    if any(critique.required_human_inspection for critique in critiques):
+                        notes.append("Cross-review requires human inspection.")
+                    return notes
+            except KeyError:
+                return []
+        if target.target_type != "duel":
+            return []
+        reviews = self.store.list_cross_reviews(duel_id=target.target_id, limit=1)
+        if not reviews:
+            return []
+        critiques = self.store.list_cross_review_critiques(reviews[0].id)
+        if not critiques:
+            return []
+        notes: list[str] = []
+        strongest = {critique.strongest_implementation for critique in critiques if critique.strongest_implementation}
+        if len(strongest) == 1:
+            notes.append(f"Cross-review leans toward `{next(iter(strongest))}`.")
+        if any(critique.required_human_inspection for critique in critiques):
+            notes.append("Cross-review requires human inspection.")
+        return notes
 
     @staticmethod
     def _ensure_safe_relative_path(path: str) -> None:

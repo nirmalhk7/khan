@@ -14,6 +14,8 @@ KHAN_HOME=/tmp/khan-state khan init
 ```yaml
 global:
   codex_bin: codex
+  codex_model: gpt-5.4-mini
+  codex_reasoning_effort: high
   cursor_agent_bin: cursor-agent
   state_dir: ~/.khan
   default_profile: default
@@ -21,10 +23,26 @@ global:
 ```
 
 - `codex_bin`: binary used by the Codex task loop and Codex adapter.
+- `codex_model`: default Codex model Khan passes when launching Codex.
+- `codex_reasoning_effort`: Codex reasoning effort override used alongside the
+  model. `high` is the Khan default.
 - `cursor_agent_bin`: binary used by the Cursor Agent adapter.
 - `state_dir`: database, artifacts, locks, schemas, and worktrees.
 - `default_profile`: profile used when a task/project does not specify one.
 - `max_concurrent_runs`: combined limit for active task runs and agent sessions.
+
+## Daemon
+
+```yaml
+daemon:
+  stale_heartbeat_seconds: 900
+  restart_on_crash: false
+```
+
+- `stale_heartbeat_seconds`: heartbeat age after which a daemon record is marked
+  failed as stale.
+- `restart_on_crash`: when enabled, Khan restarts a crashed daemon with the same
+  command and a fresh daemon record.
 
 ## Notifications
 
@@ -86,6 +104,10 @@ projects:
 - `env`: provider process environment overrides.
 - `validate_commands`: shell commands run after worker changes.
 
+`approval_policy` is still recorded in project config and shown in task prompts,
+but the current Codex CLI integration does not pass a dedicated approval-policy
+flag. The task loop relies on Codex's sandbox setting instead.
+
 ## Discovery
 
 `khan project add` uses heuristics:
@@ -96,6 +118,17 @@ projects:
 - `Makefile`: targets such as `test`, `lint`, `check`, `build`.
 
 Review inferred commands before trusting them for a project.
+
+## OS Service Templates
+
+Khan ships template files for detached supervision:
+
+- `deploy/systemd/khan.service`
+- `deploy/launchd/com.khan.khan.plist`
+
+Replace the placeholders `__KHAN_BIN__`, `__KHAN_CONFIG__`, `__KHAN_HOME__`,
+`__KHAN_WORKDIR__`, and `__KHAN_LOG_DIR__` with local paths before installing
+them.
 
 ## Task Capsules
 

@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .config import load_config
@@ -64,10 +65,13 @@ class DaemonSupervisor:
     def active_daemons(self) -> list[DaemonRecord]:
         active: list[DaemonRecord] = []
         for daemon in self.store.list_daemons(active_only=True):
+            if self._is_stale(daemon):
+                self._mark_failed_or_restart(daemon, "Heartbeat is stale.", restartable=daemon.status == "running")
+                continue
             if self.is_alive(daemon.pid):
                 active.append(daemon)
             elif daemon.status in {"running", "stopping"}:
-                self.store.finish_daemon(daemon.id, "failed", "Process is not alive.")
+                self._mark_failed_or_restart(daemon, "Process is not alive.", restartable=daemon.status == "running")
         return active
 
     def stop(self, daemon_id: str | None = None) -> DaemonRecord:
@@ -116,6 +120,42 @@ class DaemonSupervisor:
             if not self.is_alive(daemon.pid):
                 return
             time.sleep(0.05)
+
+    def _mark_failed_or_restart(self, daemon: DaemonRecord, reason: str, *, restartable: bool) -> None:
+        self.store.finish_daemon(daemon.id, "failed", reason)
+        if restartable and self.config.daemon.restart_on_crash:
+            self._restart_daemon(daemon)
+
+    def _restart_daemon(self, daemon: DaemonRecord) -> None:
+        daemon_id = self._next_daemon_id()
+        command = self._daemon_command_for_new_id(daemon.command, daemon_id)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        record = self.store.create_daemon(
+            process.pid,
+            command,
+            daemon.poll_seconds,
+            daemon.lease_timeout_seconds,
+            daemon_id=daemon_id,
+        )
+        self._started_processes[record.id] = process
+
+    def _daemon_command_for_new_id(self, command: list[str], daemon_id: str) -> list[str]:
+        rebuilt = list(command)
+        if "--daemon-id" in rebuilt:
+            index = rebuilt.index("--daemon-id")
+            if index + 1 < len(rebuilt):
+                rebuilt[index + 1] = daemon_id
+        return rebuilt
+
+    def _is_stale(self, daemon: DaemonRecord) -> bool:
+        threshold = timedelta(seconds=self.config.daemon.stale_heartbeat_seconds)
+        return datetime.now(UTC) - daemon.heartbeat_at > threshold
 
     @staticmethod
     def is_alive(pid: int) -> bool:

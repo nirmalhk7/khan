@@ -28,6 +28,10 @@ from .models import (
     DuelRecord,
     DuelStatus,
     EventRecord,
+    PipelinePhaseRecord,
+    PipelinePhaseStatus,
+    PipelineRecord,
+    PipelineStatus,
     QueueItemKind,
     QueueItemRecord,
     QueueItemStatus,
@@ -164,6 +168,31 @@ MIGRATIONS = [
     CREATE INDEX cross_reviews_duel_status ON cross_reviews(duel_id, status, updated_at);
     CREATE INDEX cross_review_critiques_session_id ON cross_review_critiques(session_id);
     """,
+    """
+    ALTER TABLE agent_sessions ADD COLUMN parent_session_id TEXT;
+    """,
+    """
+    ALTER TABLE cross_review_critiques ADD COLUMN verdict TEXT NOT NULL DEFAULT 'ESCALATE';
+    ALTER TABLE cross_review_critiques ADD COLUMN strongest_implementation TEXT NOT NULL DEFAULT '';
+    ALTER TABLE cross_review_critiques ADD COLUMN reviewer_disagreement INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE cross_review_critiques ADD COLUMN required_human_inspection INTEGER NOT NULL DEFAULT 0;
+    """,
+    """
+    CREATE TABLE pipelines (
+      id TEXT PRIMARY KEY, task_id TEXT NOT NULL, project TEXT NOT NULL, prompt TEXT NOT NULL,
+      status TEXT NOT NULL, planner_provider TEXT NOT NULL, builder_providers TEXT NOT NULL,
+      recommended_provider TEXT, decision_summary TEXT NOT NULL DEFAULT '',
+      report_path TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE pipeline_phases (
+      pipeline_id TEXT NOT NULL, phase TEXT NOT NULL, provider TEXT, status TEXT NOT NULL,
+      session_id TEXT, duel_id TEXT, cross_review_id TEXT, artifact_path TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (pipeline_id, phase, provider)
+    );
+    CREATE INDEX pipelines_project_status ON pipelines(project, status, updated_at);
+    CREATE INDEX pipeline_phases_lookup ON pipeline_phases(pipeline_id, phase, provider);
+    """,
 ]
 
 ACTIVE_STATUSES = (
@@ -173,6 +202,7 @@ ACTIVE_STATUSES = (
 ACTIVE_AGENT_SESSION_STATUSES = ("queued", "running", "stopping")
 ACTIVE_DUEL_STATUSES = ("queued", "running", "awaiting_decision")
 ACTIVE_CROSS_REVIEW_STATUSES = ("queued", "running", "awaiting_decision")
+ACTIVE_PIPELINE_STATUSES = ("queued", "planning", "building", "reviewing", "awaiting_decision")
 
 
 class RunLockedError(RuntimeError):
@@ -919,6 +949,10 @@ class Store:
         status: CrossReviewCritiqueStatus,
         *,
         session_id: str | None = None,
+        verdict: str = "ESCALATE",
+        strongest_implementation: AgentProvider | None = None,
+        reviewer_disagreement: bool = False,
+        required_human_inspection: bool = False,
         summary: str = "",
         findings: list[str] | None = None,
         artifact_path: str = "",
@@ -938,6 +972,14 @@ class Store:
             subject_provider=subject_provider,
             session_id=session_id if session_id is not None else (existing.session_id if existing else None),
             status=status,
+            verdict=verdict or (existing.verdict if existing else "ESCALATE"),
+            strongest_implementation=(
+                strongest_implementation if strongest_implementation is not None else (existing.strongest_implementation if existing else None)
+            ),
+            reviewer_disagreement=reviewer_disagreement if existing is None or reviewer_disagreement != existing.reviewer_disagreement else existing.reviewer_disagreement,
+            required_human_inspection=(
+                required_human_inspection if existing is None or required_human_inspection != existing.required_human_inspection else existing.required_human_inspection
+            ),
             summary=summary or (existing.summary if existing else ""),
             findings=findings if findings is not None else (existing.findings if existing else []),
             artifact_path=artifact_path or (existing.artifact_path if existing else ""),
@@ -947,12 +989,16 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO cross_review_critiques
-                (cross_review_id,duel_id,reviewer_provider,subject_provider,session_id,status,summary,
-                 findings,artifact_path,created_at,updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (cross_review_id,duel_id,reviewer_provider,subject_provider,session_id,status,verdict,
+                 strongest_implementation,reviewer_disagreement,required_human_inspection,summary,findings,
+                 artifact_path,created_at,updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cross_review_id, reviewer_provider, subject_provider) DO UPDATE SET
-                  session_id=excluded.session_id, status=excluded.status, summary=excluded.summary,
-                  findings=excluded.findings, artifact_path=excluded.artifact_path,
+                  session_id=excluded.session_id, status=excluded.status, verdict=excluded.verdict,
+                  strongest_implementation=excluded.strongest_implementation,
+                  reviewer_disagreement=excluded.reviewer_disagreement,
+                  required_human_inspection=excluded.required_human_inspection,
+                  summary=excluded.summary, findings=excluded.findings, artifact_path=excluded.artifact_path,
                   updated_at=excluded.updated_at""",
                 (
                     record.cross_review_id,
@@ -961,6 +1007,10 @@ class Store:
                     record.subject_provider,
                     record.session_id,
                     record.status,
+                    record.verdict,
+                    record.strongest_implementation or "",
+                    1 if record.reviewer_disagreement else 0,
+                    1 if record.required_human_inspection else 0,
                     record.summary,
                     json.dumps(record.findings),
                     record.artifact_path,
@@ -1001,7 +1051,185 @@ class Store:
         return [self._cross_review_critique_from_row(row) for row in rows]
 
     def _cross_review_critique_from_row(self, row: sqlite3.Row) -> CrossReviewCritiqueRecord:
-        return CrossReviewCritiqueRecord.model_validate({**dict(row), "findings": json.loads(row["findings"])})
+        return CrossReviewCritiqueRecord.model_validate(
+            {
+                **dict(row),
+                "findings": json.loads(row["findings"]),
+                "reviewer_disagreement": bool(row["reviewer_disagreement"]),
+                "required_human_inspection": bool(row["required_human_inspection"]),
+            }
+        )
+
+    def create_pipeline(
+        self,
+        task_id: str,
+        project: str,
+        prompt: str,
+        *,
+        planner_provider: AgentProvider = "codex",
+        builder_providers: list[AgentProvider] | None = None,
+    ) -> PipelineRecord:
+        self.get_task(task_id)
+        now = datetime.now(UTC)
+        record = PipelineRecord(
+            id=str(uuid.uuid4()),
+            task_id=task_id,
+            project=project,
+            prompt=prompt,
+            status="queued",
+            planner_provider=planner_provider,
+            builder_providers=builder_providers or ["codex", "cursor-agent"],
+            created_at=now,
+            updated_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO pipelines
+                (id,task_id,project,prompt,status,planner_provider,builder_providers,recommended_provider,
+                 decision_summary,report_path,created_at,updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, '', '', ?, ?)""",
+                (
+                    record.id,
+                    record.task_id,
+                    record.project,
+                    record.prompt,
+                    record.status,
+                    record.planner_provider,
+                    json.dumps(record.builder_providers),
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+        return record
+
+    def update_pipeline(
+        self,
+        pipeline_id: str,
+        status: PipelineStatus,
+        decision_summary: str = "",
+        *,
+        recommended_provider: AgentProvider | None = None,
+        report_path: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE pipelines SET status=?, decision_summary=?,
+                   recommended_provider=COALESCE(?, recommended_provider),
+                   report_path=COALESCE(?, report_path), updated_at=? WHERE id=?""",
+                (status, decision_summary, recommended_provider, report_path, datetime.now(UTC).isoformat(), pipeline_id),
+            )
+
+    def get_pipeline(self, pipeline_id: str) -> PipelineRecord:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM pipelines WHERE id = ?", (pipeline_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Pipeline not found: {pipeline_id}")
+        return self._pipeline_from_row(row)
+
+    def list_pipelines(self, active_only: bool = False, limit: int = 100) -> list[PipelineRecord]:
+        query = "SELECT * FROM pipelines"
+        params: tuple = ()
+        if active_only:
+            query += f" WHERE status IN ({','.join('?' for _ in ACTIVE_PIPELINE_STATUSES)})"
+            params = ACTIVE_PIPELINE_STATUSES
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params = (*params, limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._pipeline_from_row(row) for row in rows]
+
+    def upsert_pipeline_phase(
+        self,
+        pipeline_id: str,
+        phase: str,
+        status: PipelinePhaseStatus,
+        *,
+        provider: AgentProvider | None = None,
+        session_id: str | None = None,
+        duel_id: str | None = None,
+        cross_review_id: str | None = None,
+        artifact_path: str = "",
+        summary: str = "",
+    ) -> PipelinePhaseRecord:
+        now = datetime.now(UTC)
+        existing = self.get_pipeline_phase(pipeline_id, phase, provider=provider, required=False)
+        created_at = existing.created_at if existing else now
+        record = PipelinePhaseRecord(
+            pipeline_id=pipeline_id,
+            phase=phase,  # type: ignore[arg-type]
+            provider=provider,
+            status=status,
+            session_id=session_id if session_id is not None else (existing.session_id if existing else None),
+            duel_id=duel_id if duel_id is not None else (existing.duel_id if existing else None),
+            cross_review_id=cross_review_id if cross_review_id is not None else (existing.cross_review_id if existing else None),
+            artifact_path=artifact_path or (existing.artifact_path if existing else ""),
+            summary=summary or (existing.summary if existing else ""),
+            created_at=created_at,
+            updated_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO pipeline_phases
+                (pipeline_id,phase,provider,status,session_id,duel_id,cross_review_id,artifact_path,summary,created_at,updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pipeline_id, phase, provider) DO UPDATE SET
+                  status=excluded.status, session_id=excluded.session_id, duel_id=excluded.duel_id,
+                  cross_review_id=excluded.cross_review_id, artifact_path=excluded.artifact_path,
+                  summary=excluded.summary, updated_at=excluded.updated_at""",
+                (
+                    record.pipeline_id,
+                    record.phase,
+                    record.provider or "",
+                    record.status,
+                    record.session_id,
+                    record.duel_id,
+                    record.cross_review_id,
+                    record.artifact_path,
+                    record.summary,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                ),
+            )
+        return record
+
+    def get_pipeline_phase(
+        self,
+        pipeline_id: str,
+        phase: str,
+        *,
+        provider: AgentProvider | None = None,
+        required: bool = True,
+    ) -> PipelinePhaseRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pipeline_phases WHERE pipeline_id=? AND phase=? AND provider=?",
+                (pipeline_id, phase, provider or ""),
+            ).fetchone()
+        if row is None:
+            if required:
+                raise KeyError(f"Pipeline phase not found: {pipeline_id}/{phase}/{provider or '-'}")
+            return None
+        return self._pipeline_phase_from_row(row)
+
+    def list_pipeline_phases(self, pipeline_id: str) -> list[PipelinePhaseRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pipeline_phases WHERE pipeline_id=? ORDER BY created_at ASC",
+                (pipeline_id,),
+            ).fetchall()
+        return [self._pipeline_phase_from_row(row) for row in rows]
+
+    def _pipeline_from_row(self, row: sqlite3.Row) -> PipelineRecord:
+        return PipelineRecord.model_validate(
+            {
+                **dict(row),
+                "builder_providers": json.loads(row["builder_providers"]),
+                "recommended_provider": row["recommended_provider"] or None,
+            }
+        )
+
+    def _pipeline_phase_from_row(self, row: sqlite3.Row) -> PipelinePhaseRecord:
+        return PipelinePhaseRecord.model_validate({**dict(row), "provider": row["provider"] or None})
 
     def create_agent_session(
         self,
@@ -1011,6 +1239,7 @@ class Store:
         prompt: str,
         *,
         session_id: str | None = None,
+        parent_session_id: str | None = None,
     ) -> AgentSessionRecord:
         now = datetime.now(UTC)
         session = AgentSessionRecord(
@@ -1020,15 +1249,16 @@ class Store:
             status="queued",
             workspace=workspace,
             prompt=prompt,
+            parent_session_id=parent_session_id,
             created_at=now,
             updated_at=now,
         )
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO agent_sessions
-                (id, provider, project, status, workspace, prompt, summary, external_id, process_id,
+                (id, provider, project, status, workspace, prompt, summary, parent_session_id, external_id, process_id,
                  started_at, ended_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)""",
                 (
                     session.id,
                     session.provider,
@@ -1037,6 +1267,7 @@ class Store:
                     session.workspace,
                     session.prompt,
                     session.summary,
+                    session.parent_session_id,
                     session.created_at.isoformat(),
                     session.updated_at.isoformat(),
                 ),

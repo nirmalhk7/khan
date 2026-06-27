@@ -44,6 +44,37 @@ class AgentAdapter(Protocol):
     def summarize(self, command: AgentCommand, last_message: str, stderr_lines: list[str]) -> str:
         ...
 
+    def supports_steering(self) -> bool:
+        ...
+
+    def resume_command(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        ...
+
+    def send_message(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        ...
+
 
 class JsonlAgentAdapter:
     name = ""
@@ -69,6 +100,37 @@ class JsonlAgentAdapter:
     def summarize(self, command: AgentCommand, last_message: str, stderr_lines: list[str]) -> str:
         return last_message or "\n".join(stderr_lines).strip()
 
+    def supports_steering(self) -> bool:
+        return False
+
+    def resume_command(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        return None
+
+    def send_message(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        return None
+
     def _message_from_payload(self, payload: dict[str, Any]) -> str:
         for key in self.message_keys:
             value = payload.get(key)
@@ -86,6 +148,9 @@ class JsonlAgentAdapter:
 
 class CodexAgentAdapter(JsonlAgentAdapter):
     name = "codex"
+
+    def supports_steering(self) -> bool:
+        return True
 
     def build_command(
         self,
@@ -105,12 +170,14 @@ class CodexAgentAdapter(JsonlAgentAdapter):
                 "--json",
                 "--output-last-message",
                 str(output_path),
+                "-m",
+                config.global_config.codex_model,
+                "-c",
+                f'model_reasoning_effort="{config.global_config.codex_reasoning_effort}"',
                 "-C",
                 str(workspace),
                 "-s",
                 project.sandbox,
-                "-a",
-                project.approval_policy,
                 "-",
             ],
             stdin=prompt,
@@ -124,9 +191,73 @@ class CodexAgentAdapter(JsonlAgentAdapter):
                 return content
         return super().summarize(command, last_message, stderr_lines)
 
+    def resume_command(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        if Path(config.global_config.codex_bin).name.startswith("fake-"):
+            return None
+        output_path = store.run_dir(session_id) / "codex-last-message.txt"
+        return AgentCommand(
+            argv=[
+                config.global_config.codex_bin,
+                "exec",
+                "--json",
+                "--resume",
+                external_session_id,
+                "--output-last-message",
+                str(output_path),
+                "-m",
+                config.global_config.codex_model,
+                "-c",
+                f'model_reasoning_effort="{config.global_config.codex_reasoning_effort}"',
+                "-C",
+                str(workspace),
+                "-s",
+                project.sandbox,
+                "-",
+            ],
+            stdin=message,
+            output_path=output_path,
+        )
+
+    def send_message(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        return self.resume_command(
+            config=config,
+            project=project,
+            store=store,
+            workspace=workspace,
+            prompt=prompt,
+            session_id=session_id,
+            external_session_id=external_session_id,
+            message=message,
+        )
+
 
 class CursorAgentAdapter(JsonlAgentAdapter):
     name = "cursor-agent"
+
+    def supports_steering(self) -> bool:
+        return True
 
     def build_command(
         self,
@@ -151,6 +282,60 @@ class CursorAgentAdapter(JsonlAgentAdapter):
                 "disabled" if project.sandbox == "danger-full-access" else "enabled",
                 prompt,
             ]
+        )
+
+    def resume_command(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        if Path(config.global_config.cursor_agent_bin).name.startswith("fake-"):
+            return None
+        return AgentCommand(
+            argv=[
+                config.global_config.cursor_agent_bin,
+                "--resume",
+                external_session_id,
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--workspace",
+                str(workspace),
+                "--trust",
+                "--sandbox",
+                "disabled" if project.sandbox == "danger-full-access" else "enabled",
+                message,
+            ]
+        )
+
+    def send_message(
+        self,
+        *,
+        config: ConfigFile,
+        project: ProjectConfig,
+        store: Store,
+        workspace: Path,
+        prompt: str,
+        session_id: str,
+        external_session_id: str,
+        message: str,
+    ) -> AgentCommand | None:
+        return self.resume_command(
+            config=config,
+            project=project,
+            store=store,
+            workspace=workspace,
+            prompt=prompt,
+            session_id=session_id,
+            external_session_id=external_session_id,
+            message=message,
         )
 
 

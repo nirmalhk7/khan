@@ -37,35 +37,53 @@ class AgentSessionRunner:
         prompt: str,
         *,
         force_worktree: bool = False,
+        workspace: Path | None = None,
+        parent_session_id: str | None = None,
+        resume_external_session_id: str | None = None,
+        resume_message: str | None = None,
     ) -> str:
         try:
             adapter = self.registry.get(provider)
         except KeyError as exc:
             raise AgentSessionError(str(exc)) from exc
         project = self._project(project_name)
-        with self.store.run_lock("__agent_scheduler__"):
+        with self.store.run_lock("__agent_scheduler__", blocking=True):
             active_count = len(self.store.list_runs(active_only=True)) + len(self.store.list_agent_sessions(active_only=True))
             if active_count >= self.config.global_config.max_concurrent_runs:
                 raise RuntimeError("Maximum concurrent run limit reached.")
-            active_project_sessions = self.store.active_agent_sessions_for_project(project.name)
-            workspace_key = str(uuid.uuid4())
-            workspace, is_worktree = self.worktrees.choose_workspace(
-                project,
-                workspace_key,
-                force_worktree or bool(active_project_sessions),
-            )
+            if workspace is None:
+                active_project_sessions = self.store.active_agent_sessions_for_project(project.name)
+                workspace_key = str(uuid.uuid4())
+                workspace, is_worktree = self.worktrees.choose_workspace(
+                    project,
+                    workspace_key,
+                    force_worktree or bool(active_project_sessions),
+                )
+            else:
+                workspace = workspace.expanduser().resolve()
+                is_worktree = workspace != project.path.resolve()
+                workspace_key = str(uuid.uuid4())
             session = self.store.create_agent_session(
                 adapter.name,
                 project.name,
                 str(workspace),
                 prompt,
                 session_id=workspace_key,
+                parent_session_id=parent_session_id,
             )
 
         self._event(session.id, "system", "Session queued", {"provider": adapter.name, "workspace": str(workspace)})
         try:
             with self.store.run_lock(f"agent-session-{session.id}"):
-                return self._run_session(session.id, adapter, project, workspace, prompt)
+                return self._run_session(
+                    session.id,
+                    adapter,
+                    project,
+                    workspace,
+                    prompt,
+                    resume_external_session_id=resume_external_session_id,
+                    resume_message=resume_message,
+                )
         finally:
             final_status = self.store.get_agent_session(session.id).status
             if is_worktree and final_status not in {"succeeded", "cancelled"}:
@@ -93,15 +111,42 @@ class AgentSessionRunner:
         project: ProjectConfig,
         workspace: Path,
         prompt: str,
+        *,
+        resume_external_session_id: str | None = None,
+        resume_message: str | None = None,
     ) -> str:
-        command = adapter.build_command(
-            config=self.config,
-            project=project,
-            store=self.store,
-            workspace=workspace,
-            prompt=prompt,
-            session_id=session_id,
-        )
+        command = None
+        if resume_external_session_id and resume_message and getattr(adapter, "supports_steering", lambda: False)():
+            command = getattr(adapter, "resume_command", lambda **_: None)(
+                config=self.config,
+                project=project,
+                store=self.store,
+                workspace=workspace,
+                prompt=prompt,
+                session_id=session_id,
+                external_session_id=resume_external_session_id,
+                message=resume_message,
+            )
+            if command is None:
+                command = getattr(adapter, "send_message", lambda **_: None)(
+                    config=self.config,
+                    project=project,
+                    store=self.store,
+                    workspace=workspace,
+                    prompt=prompt,
+                    session_id=session_id,
+                    external_session_id=resume_external_session_id,
+                    message=resume_message,
+                )
+        if command is None:
+            command = adapter.build_command(
+                config=self.config,
+                project=project,
+                store=self.store,
+                workspace=workspace,
+                prompt=prompt,
+                session_id=session_id,
+            )
         self._event(session_id, "system", "Starting agent process", {"command": command.argv})
         process = subprocess.Popen(
             command.argv,

@@ -28,11 +28,13 @@ khan ask . "Implement the feature and run the inferred checks."
 
 This creates or reuses a project config for the current git repository, infers
 validation commands from repo files, persists a task capsule, and runs the
-normal Codex task loop. To hand the task to a queue worker or detached daemon
-instead:
+default multi-agent pipeline. Codex plans, Codex and Cursor Agent build in
+isolated worktrees, cross-review runs when both builders finish, and the result
+is an explicit decision card. To hand the same pipeline to a queue worker or
+detached daemon instead:
 
 ```bash
-khan ask . "Implement the feature and run the inferred checks." --enqueue
+khan ask . "Implement the feature and run the inferred checks." --mode queue
 khan daemon start
 ```
 
@@ -43,6 +45,46 @@ khan ask . "Update the CLI docs." \
   --accept "README and docs/cli.md mention the command." \
   --verify "make test"
 ```
+
+When `ask` runs immediately, it prints the evidence ledger after the status
+line so the pipeline report, decision card, and artifacts are visible in the
+same terminal. Use `--mode single` for the original one-agent Codex loop.
+
+## Inspect And Explain
+
+When a run, session, duel, or adoption needs review:
+
+```bash
+khan inbox
+khan show <id>
+khan last --kind run
+khan get
+khan summary <id>
+khan diff <id>
+khan explain <id>
+khan explain <id> --json
+```
+
+`inbox` is the actionable view, `show` is the human-readable decision/evidence
+view, and `summary` is the compact snapshot. `explain` is the evidence ledger
+and is what you want when you need structured output or to reconstruct why Khan
+made a decision.
+
+## Relay, Replay, And Steer
+
+Use these when you want the model to carry state forward explicitly:
+
+```bash
+khan relay . "Implement the feature in two steps." --preset "codex-plan cursor-build"
+khan steer <session-id> "Continue from the last transcript."
+khan replay <run-id> --provider codex
+khan replay <run-id> --provider cursor-agent
+khan bench prompts.yaml
+```
+
+Relay persists the handoff prompt, steer keeps the same session lineage where it
+can, replay reuses the original task and project context, and bench runs repeat
+items from a YAML prompt list.
 
 ## Human-Input Stops
 
@@ -112,7 +154,7 @@ Inspect the operator decision record:
 ```bash
 khan duel show <duel-id>
 khan duel artifacts <duel-id>
-khan attention
+khan inbox
 ```
 
 Duels always force isolated git worktrees for participants, even if the project
@@ -136,13 +178,16 @@ Inspect the result:
 ```bash
 khan cross-review-show <cross-review-id>
 khan cross-review-artifacts <cross-review-id>
-khan attention
+khan inbox
 ```
 
 Cross-review uses the same configured project review prompt for every
 reviewer/subject pair. Reviewers run as normal provider-neutral sessions in
 isolated worktrees, so critiques are captured with the same stdout/stderr,
 summary, external session ID, and artifact plumbing as regular sessions.
+Khan also parses the reviewer verdict line into structured fields so operator
+warnings can reflect which implementation looks strongest and whether human
+inspection is still required.
 
 ## Adoption And Rejection
 
@@ -172,6 +217,8 @@ Adoption safety rules:
 - Khan refuses same-workspace adoption because there is nothing safe to copy.
 - Candidate paths are checked for absolute paths, `..`, and `.git`.
 - Protected path changes are called out in the recorded decision summary.
+- Cross-review warnings are folded into the recorded decision summary when the
+  source candidate has already been reviewed.
 - Failed adoption attempts are recorded with `status: failed`.
 
 ## Queue And Daemon
@@ -207,8 +254,19 @@ a detached daemon process. `daemon status` shows PID, heartbeat, status, last
 processed queue item, and errors. Khan reclaims stale running queue leases before
 workers claim new work.
 
+`daemon logs` prints a compact text view of recent daemon records.
+
 Use the same `--config <path>` with `daemon start`, `daemon status`, and
 `daemon stop` when operating a non-default Khan state store.
+
+Daemon health is driven by the configured `daemon.stale_heartbeat_seconds`
+threshold. If `daemon.restart_on_crash` is enabled, Khan restarts a crashed
+daemon with the same command and records the restart as a new daemon row.
+
+For OS-level supervision, adapt the included templates:
+
+- `deploy/systemd/khan.service`
+- `deploy/launchd/com.khan.khan.plist`
 
 ## Cancellation
 
@@ -264,10 +322,13 @@ Coverage currently includes:
 - queue worker success and failure handling
 - detached daemon start/status/stop
 - stale queue lease recovery
-- zero-friction `ask` project auto-discovery, immediate runs, and enqueue mode
+- zero-friction `ask` project auto-discovery, pipeline mode, single mode, and queue mode
+- operator inspection commands (`inbox`, `show`, `last`, `get`, `summary`, `diff`, `explain`)
+- relay, replay, bench, and steer command flows
 - provider duel records, reports, and worktree isolation
 - cross-review records, critique artifacts, and report artifacts
 - adopt/reject decisions, dirty-destination refusal, and rejection cleanup
+- adoption validation and commit creation
 - agent session persistence
 - built-in Codex and Cursor Agent sessions
 - custom adapter registration
@@ -275,10 +336,4 @@ Coverage currently includes:
 
 ## Known Operational Gaps
 
-- No automatic crash restart policy or daemon log tailing yet.
 - No web UI.
-- TUI cannot yet perform actions from selected rows.
-- Provider-neutral sessions cannot yet resume or steer an existing external
-  chat/session.
-- Successful adoption cleanup is opt-in with `--cleanup`; no retention policy
-  runs automatically.

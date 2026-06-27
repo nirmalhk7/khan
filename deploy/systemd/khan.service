@@ -1,0 +1,15 @@
+[Unit]
+Description=Khan daemon
+After=network.target
+
+[Service]
+Type=simple
+Environment=KHAN_HOME=__KHAN_HOME__
+ExecStart=__KHAN_BIN__ daemon run --config __KHAN_CONFIG__
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=__KHAN_WORKDIR__
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .agent_adapters import DEFAULT_AGENT_REGISTRY, AgentAdapterRegistry
@@ -39,12 +40,18 @@ class DuelRunner:
         self._validate_providers(selected)
         duel = self.store.create_duel(project.name, prompt, selected)
         self.store.update_duel(duel.id, "running", f"Running duel across {', '.join(selected)}.")
+        capsule_artifact = self._write_task_capsule_artifact(duel, project)
 
-        for provider in selected:
-            self._run_participant(duel, project, provider, validate=validate)
+        with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+            futures = {
+                executor.submit(self._run_participant, duel, project, provider, validate=validate): provider
+                for provider in selected
+            }
+            for future in as_completed(futures):
+                future.result()
 
-        participants = self.store.list_duel_participants(duel.id)
-        report = self._write_report(duel, participants)
+        participants = [self.store.get_duel_participant(duel.id, provider) for provider in selected]
+        report = self._write_report(duel, participants, capsule_artifact)
         status = "awaiting_decision" if any(p.status == "succeeded" for p in participants) else "failed"
         summary = self._duel_summary(participants)
         self.store.update_duel(duel.id, status, summary, report_path=str(report))
@@ -209,7 +216,7 @@ class DuelRunner:
             lines.append(f"- `{event.stream}` {event.ts.isoformat()} {event.message} `{payload}`")
         return self.store.write_artifact(duel.id, f"{self._safe_provider(provider)}-result.md", "\n".join(lines) + "\n")
 
-    def _write_report(self, duel: DuelRecord, participants: list[DuelParticipantRecord]) -> Path:
+    def _write_report(self, duel: DuelRecord, participants: list[DuelParticipantRecord], capsule_artifact: Path | None = None) -> Path:
         lines = [
             "# Duel Report",
             "",
@@ -220,12 +227,18 @@ class DuelRunner:
             "## Task",
             "",
             duel.prompt,
+        ]
+        if capsule_artifact:
+            lines.extend(["", f"- Task capsule artifact: `{capsule_artifact}`"])
+        lines.extend(
+            [
             "",
             "## Provider Comparison",
             "",
             "| Provider | Status | Validation | Changed Files | Runtime | Workspace |",
             "| --- | --- | --- | ---: | ---: | --- |",
         ]
+        )
         for participant in participants:
             validation = (
                 "skipped" if participant.validation_ok is None else "pass" if participant.validation_ok else "fail"
@@ -237,7 +250,7 @@ class DuelRunner:
                 f"`{participant.workspace or '-'}` |"
             )
 
-        lines.extend(["", "## Recommendation", "", self._recommendation(participants), "", "## Participant Details", ""])
+        lines.extend(["", "## Recommendation", "", self._recommendation(duel, participants), "", "## Participant Details", ""])
         for participant in participants:
             lines.extend(
                 [
@@ -264,12 +277,20 @@ class DuelRunner:
         status_bits = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
         return f"Duel complete; awaiting operator decision ({status_bits})."
 
-    def _recommendation(self, participants: list[DuelParticipantRecord]) -> str:
+    def _recommendation(self, duel: DuelRecord, participants: list[DuelParticipantRecord]) -> str:
         passing = [p for p in participants if p.status == "succeeded" and p.validation_ok is not False]
         if len(passing) == 1:
             return f"Inspect and consider adopting `{passing[0].provider}`; it is the only candidate without validation failure."
         if len(passing) > 1:
-            return "Multiple candidates completed without validation failure. Compare changed files and summaries before adopting."
+            scores = {participant.provider: self._participant_score(duel, participant) for participant in passing}
+            best_score = max(scores.values())
+            winners = sorted(provider for provider, score in scores.items() if score == best_score)
+            if len(winners) == 1:
+                return (
+                    f"Multiple candidates completed without validation failure. `{winners[0]}` has the strongest overall score "
+                    "after considering validation, diff size, and protected-path impact."
+                )
+            return "Multiple candidates completed without validation failure. Compare changed files, risks, and validation summaries before adopting."
         return "No candidate completed cleanly. Inspect participant artifacts before retrying or changing the prompt."
 
     def _open_risks(self, summary: str, changed_files: list[str], validation_ok: bool | None) -> list[str]:
@@ -284,6 +305,44 @@ class DuelRunner:
                 risks.append(f"Provider summary mentions `{marker}`.")
                 break
         return risks
+
+    def _participant_score(self, duel: DuelRecord, participant: DuelParticipantRecord) -> int:
+        score = 0
+        if participant.status == "succeeded":
+            score += 60
+        if participant.validation_ok is True:
+            score += 25
+        elif participant.validation_ok is False:
+            score -= 25
+        score -= min(len(participant.changed_files), 10) * 2
+        score -= min(len(participant.open_risks), 10) * 3
+        protected = [
+            path
+            for path in participant.changed_files
+            if any(
+                path == protected_path or path.startswith(f"{protected_path.rstrip('/')}/")
+                for protected_path in self.config.projects[duel.project].protected_paths
+            )
+        ]
+        score -= len(protected) * 15
+        return score
+
+    def _write_task_capsule_artifact(self, duel: DuelRecord, project: ProjectConfig) -> Path:
+        capsule = {
+            "objective": duel.prompt,
+            "acceptance_criteria": [f"Implement the task described in duel {duel.id}."],
+            "verification": list(project.validate_commands),
+            "protected_paths": list(project.protected_paths),
+            "allowed_paths": [],
+            "conflict_domains": [project.name],
+            "blast_radius": "medium" if project.protected_paths else "small",
+            "providers": list(duel.providers),
+        }
+        return self.store.write_artifact(
+            duel.id,
+            "duel-task-capsule.json",
+            json.dumps(capsule, indent=2, sort_keys=True),
+        )
 
     def _git_root(self, path: Path) -> Path | None:
         process = subprocess.run(

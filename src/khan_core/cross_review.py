@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import re
 from pathlib import Path
 
 from .agent_adapters import DEFAULT_AGENT_REGISTRY, AgentAdapterRegistry
@@ -36,6 +37,8 @@ class CrossReviewRunner:
                 self._run_critique(record, project, reviewer, subject)
 
         critiques = self.store.list_cross_review_critiques(record.id)
+        self._finalize_critiques(record.id, critiques)
+        critiques = self.store.list_cross_review_critiques(record.id)
         report = self._write_report(record, critiques)
         status = "awaiting_decision" if any(c.status == "succeeded" for c in critiques) else "failed"
         summary = self._summary(critiques)
@@ -65,6 +68,7 @@ class CrossReviewRunner:
             session_id = runner.start_session(reviewer.provider, project.name, prompt, force_worktree=True)
             session = self.store.get_agent_session(session_id)
             findings = self._findings(session.summary)
+            analysis = self._review_analysis(session.summary, reviewer.provider, subject.provider)
             artifact = self._write_critique_artifact(record, reviewer.provider, subject, session_id, prompt, session.summary, findings)
             status = "succeeded" if session.status == "succeeded" else "failed"
             return self.store.upsert_cross_review_critique(
@@ -74,6 +78,10 @@ class CrossReviewRunner:
                 subject.provider,
                 status,
                 session_id=session_id,
+                verdict=analysis["verdict"],
+                strongest_implementation=analysis["strongest_implementation"],
+                reviewer_disagreement=analysis["reviewer_disagreement"],
+                required_human_inspection=analysis["required_human_inspection"],
                 summary=session.summary,
                 findings=findings,
                 artifact_path=str(artifact),
@@ -91,6 +99,10 @@ class CrossReviewRunner:
                 reviewer.provider,
                 subject.provider,
                 "failed",
+                verdict="ESCALATE",
+                strongest_implementation=None,
+                reviewer_disagreement=True,
+                required_human_inspection=True,
                 summary=summary,
                 findings=[summary],
                 artifact_path=str(artifact),
@@ -181,6 +193,17 @@ class CrossReviewRunner:
         for event in events:
             payload = json.dumps(event.payload, sort_keys=True) if event.payload else "{}"
             lines.append(f"- `{event.stream}` {event.ts.isoformat()} {event.message} `{payload}`")
+        lines.extend(
+            [
+                "",
+                "## Parsed Decision",
+                "",
+                f"- Verdict: `{self._parse_verdict(summary)}`",
+                f"- Strongest implementation: `{self._parse_strongest(summary, subject.provider) or '-'}`",
+                f"- Reviewer disagreement: `{self._parse_disagreement(summary)}`",
+                f"- Human inspection required: `{self._parse_human_inspection(summary)}`",
+            ]
+        )
         return self.store.write_artifact(
             record.id,
             f"{self._safe_provider(reviewer_provider)}-reviews-{self._safe_provider(subject.provider)}.md",
@@ -208,6 +231,11 @@ class CrossReviewRunner:
                 [
                     f"## {critique.reviewer_provider} on {critique.subject_provider}",
                     "",
+                    f"- Verdict: `{critique.verdict}`",
+                    f"- Strongest implementation: `{critique.strongest_implementation or '-'}`",
+                    f"- Reviewer disagreement: `{critique.reviewer_disagreement}`",
+                    f"- Human inspection required: `{critique.required_human_inspection}`",
+                    "",
                     critique.summary or "_No summary recorded._",
                     "",
                 ]
@@ -221,7 +249,11 @@ class CrossReviewRunner:
     def _summary(self, critiques: list[CrossReviewCritiqueRecord]) -> str:
         succeeded = sum(1 for critique in critiques if critique.status == "succeeded")
         failed = sum(1 for critique in critiques if critique.status == "failed")
-        return f"Cross-review complete; awaiting operator decision (succeeded={succeeded}, failed={failed})."
+        verdicts = ", ".join(
+            f"{verdict}={sum(1 for critique in critiques if critique.verdict == verdict)}"
+            for verdict in ("PASS", "FIX", "ESCALATE")
+        )
+        return f"Cross-review complete; awaiting operator decision (succeeded={succeeded}, failed={failed}, {verdicts})."
 
     def _decision_card(self, critiques: list[CrossReviewCritiqueRecord]) -> str:
         if not critiques:
@@ -229,6 +261,13 @@ class CrossReviewRunner:
         failed = [critique for critique in critiques if critique.status == "failed"]
         if failed:
             return "At least one critique failed. Inspect failed critique artifacts before adopting."
+        if any(critique.required_human_inspection for critique in critiques):
+            return "One or more critiques require human inspection before adopting."
+        strongest = {critique.strongest_implementation for critique in critiques if critique.strongest_implementation}
+        if len(strongest) == 1:
+            return f"Structured review leans toward `{next(iter(strongest))}`. Validate manually before adopting."
+        if len(strongest) > 1:
+            return f"Reviewers disagreed on the strongest implementation: {', '.join(sorted(strongest))}."
         finding_counts: dict[str, int] = {}
         for critique in critiques:
             finding_counts[critique.subject_provider] = finding_counts.get(critique.subject_provider, 0) + len(critique.findings)
@@ -237,6 +276,39 @@ class CrossReviewRunner:
         lowest = min(finding_counts.values())
         candidates = sorted(provider for provider, count in finding_counts.items() if count == lowest)
         return f"Fewest parsed findings: {', '.join(candidates)}. Validate manually before adoption."
+
+    def _finalize_critiques(self, cross_review_id: str, critiques: list[CrossReviewCritiqueRecord]) -> None:
+        if not critiques:
+            return
+        disagreement = len({critique.verdict for critique in critiques}) > 1
+        human_required = any(
+            critique.required_human_inspection
+            or critique.verdict == "ESCALATE"
+            or self._parse_human_inspection(critique.summary)
+            for critique in critiques
+        )
+        strongest_candidates = [critique.strongest_implementation for critique in critiques if critique.strongest_implementation]
+        if not strongest_candidates:
+            passing = [critique.subject_provider for critique in critiques if critique.verdict == "PASS"]
+            if len(passing) == 1:
+                strongest_candidates = passing
+        strongest = strongest_candidates[0] if len(strongest_candidates) == 1 else None
+        for critique in critiques:
+            self.store.upsert_cross_review_critique(
+                cross_review_id,
+                critique.duel_id,
+                critique.reviewer_provider,
+                critique.subject_provider,
+                critique.status,
+                session_id=critique.session_id,
+                verdict=critique.verdict,
+                strongest_implementation=critique.strongest_implementation or strongest,
+                reviewer_disagreement=disagreement,
+                required_human_inspection=human_required,
+                summary=critique.summary,
+                findings=critique.findings,
+                artifact_path=critique.artifact_path,
+            )
 
     def _findings(self, summary: str) -> list[str]:
         findings: list[str] = []
@@ -253,6 +325,47 @@ class CrossReviewRunner:
         if not findings and summary.strip():
             findings.append(summary.strip()[:500])
         return findings
+
+    def _review_analysis(self, summary: str, reviewer_provider: AgentProvider, subject_provider: AgentProvider) -> dict[str, object]:
+        verdict = self._parse_verdict(summary)
+        strongest = self._parse_strongest(summary, subject_provider)
+        required_human_inspection = self._parse_human_inspection(summary) or verdict == "ESCALATE"
+        reviewer_disagreement = self._parse_disagreement(summary)
+        if not strongest and verdict == "PASS":
+            strongest = subject_provider
+        return {
+            "verdict": verdict,
+            "strongest_implementation": strongest,
+            "reviewer_disagreement": reviewer_disagreement,
+            "required_human_inspection": required_human_inspection,
+        }
+
+    def _parse_verdict(self, summary: str) -> str:
+        for line in summary.splitlines():
+            match = re.match(r"VERDICT:\s*(PASS|FIX|ESCALATE)\b", line.strip(), re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+        return "ESCALATE"
+
+    def _parse_strongest(self, summary: str, fallback: AgentProvider) -> AgentProvider | None:
+        patterns = (
+            r"strongest implementation[:\s]+([A-Za-z0-9_.-]+)",
+            r"winner[:\s]+([A-Za-z0-9_.-]+)",
+            r"recommend(?:ation)?[:\s]+([A-Za-z0-9_.-]+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, summary, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return fallback if self._parse_verdict(summary) == "PASS" else None
+
+    def _parse_disagreement(self, summary: str) -> bool:
+        lowered = summary.lower()
+        return any(marker in lowered for marker in ("disagree", "disagreement", "conflict", "contrast"))
+
+    def _parse_human_inspection(self, summary: str) -> bool:
+        lowered = summary.lower()
+        return any(marker in lowered for marker in ("human", "manual", "inspect", "operator"))
 
     def _git_text(self, workspace: Path, *args: str) -> str:
         process = subprocess.run(["git", *args], cwd=workspace, text=True, capture_output=True, check=False)

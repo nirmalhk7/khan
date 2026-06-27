@@ -9,6 +9,7 @@ from .agents import AgentSessionRunner
 from .config import load_config
 from .loop_engine import LoopEngine
 from .models import QueueItemRecord
+from .pipeline import PipelineRunner
 from .store import Store
 
 
@@ -83,4 +84,18 @@ class QueueWorker:
                 prompt,
                 force_worktree=force_worktree,
             )
+        if item.kind == "pipeline":
+            task_id = item.payload.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise QueueWorkerError("Pipeline queue item missing task_id")
+            builder_providers = item.payload.get("builder_providers")
+            if builder_providers is not None and not isinstance(builder_providers, list):
+                raise QueueWorkerError("Pipeline queue item builder_providers must be a list")
+            task = self.store.get_task(task_id)
+            pipeline = PipelineRunner(self.config_path).run_pipeline(
+                task,
+                planner_provider=str(item.payload.get("planner_provider") or "codex"),
+                builder_providers=builder_providers,
+            )
+            return pipeline.id
         raise QueueWorkerError(f"Unsupported queue item kind: {item.kind}")

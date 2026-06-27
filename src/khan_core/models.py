@@ -17,15 +17,17 @@ AgentSessionStatus = Literal[
     "cancelled",
 ]
 
-QueueItemKind = Literal["task", "session"]
+QueueItemKind = Literal["task", "session", "pipeline"]
 QueueItemStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
 DaemonStatus = Literal["running", "stopping", "stopped", "failed"]
 DuelStatus = Literal["queued", "running", "awaiting_decision", "adopted", "rejected", "failed", "cancelled"]
 DuelParticipantStatus = Literal["queued", "running", "succeeded", "adopted", "rejected", "failed", "cancelled"]
-AdoptionTargetType = Literal["duel", "session", "run"]
+AdoptionTargetType = Literal["duel", "session", "run", "pipeline"]
 AdoptionStatus = Literal["adopted", "rejected", "failed"]
 CrossReviewStatus = Literal["queued", "running", "awaiting_decision", "failed"]
 CrossReviewCritiqueStatus = Literal["queued", "running", "succeeded", "failed"]
+PipelineStatus = Literal["queued", "planning", "building", "reviewing", "awaiting_decision", "adopted", "rejected", "failed", "cancelled"]
+PipelinePhaseStatus = Literal["queued", "running", "succeeded", "failed", "skipped"]
 
 RunStatus = Literal[
     "queued",
@@ -62,6 +64,8 @@ class LoopProfile(BaseModel):
 
 class GlobalConfig(BaseModel):
     codex_bin: str = "codex"
+    codex_model: str = "gpt-5.4-mini"
+    codex_reasoning_effort: str = "high"
     cursor_agent_bin: str = "cursor-agent"
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".khan")
     default_profile: str = "default"
@@ -72,6 +76,15 @@ class NotificationConfig(BaseModel):
     input_needed: bool = True
     say_bin: str = "say"
     phrase: str = "Khan needs your input."
+
+
+class AdoptionConfig(BaseModel):
+    retention_days: int = 7
+
+
+class DaemonConfig(BaseModel):
+    stale_heartbeat_seconds: int = 900
+    restart_on_crash: bool = False
 
 
 class ProjectConfig(BaseModel):
@@ -96,6 +109,8 @@ class ProjectConfig(BaseModel):
 class ConfigFile(BaseModel):
     global_config: GlobalConfig = Field(default_factory=GlobalConfig, alias="global")
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
+    adoption: AdoptionConfig = Field(default_factory=AdoptionConfig)
+    daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     profiles: dict[str, LoopProfile] = Field(default_factory=lambda: {"default": LoopProfile()})
     projects: dict[str, ProjectConfig] = Field(default_factory=dict)
     prompts: dict[str, str] = Field(default_factory=dict)
@@ -146,6 +161,7 @@ class AgentSessionRecord(BaseModel):
     workspace: str
     prompt: str
     summary: str = ""
+    parent_session_id: str | None = None
     external_id: str | None = None
     process_id: int | None = None
     started_at: datetime | None = None
@@ -254,9 +270,42 @@ class CrossReviewCritiqueRecord(BaseModel):
     subject_provider: AgentProvider
     session_id: str | None = None
     status: CrossReviewCritiqueStatus
+    verdict: Literal["PASS", "FIX", "ESCALATE"] = "ESCALATE"
+    strongest_implementation: AgentProvider | None = None
+    reviewer_disagreement: bool = False
+    required_human_inspection: bool = False
     summary: str = ""
     findings: list[str] = Field(default_factory=list)
     artifact_path: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class PipelineRecord(BaseModel):
+    id: str
+    task_id: str
+    project: str
+    prompt: str
+    status: PipelineStatus
+    planner_provider: AgentProvider = "codex"
+    builder_providers: list[AgentProvider] = Field(default_factory=list)
+    recommended_provider: AgentProvider | None = None
+    decision_summary: str = ""
+    report_path: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+
+class PipelinePhaseRecord(BaseModel):
+    pipeline_id: str
+    phase: Literal["plan", "build", "review", "decide"]
+    provider: AgentProvider | None = None
+    status: PipelinePhaseStatus = "queued"
+    session_id: str | None = None
+    duel_id: str | None = None
+    cross_review_id: str | None = None
+    artifact_path: str = ""
+    summary: str = ""
     created_at: datetime
     updated_at: datetime
 
@@ -280,6 +329,9 @@ class ReviewResult(BaseModel):
     verdict: Literal["PASS", "FIX", "ESCALATE"]
     findings: list[str] = Field(default_factory=list)
     raw_output: str = ""
+
+
+AskMode = Literal["pipeline", "single", "queue"]
 
 
 class RunProcess(BaseModel):
@@ -316,12 +368,17 @@ class TaskCapsule(BaseModel):
 
 class DecisionCard(BaseModel):
     run_id: str
-    subject_type: Literal["run", "session", "queue", "daemon", "duel", "cross_review"] = "run"
+    subject_type: Literal["run", "session", "queue", "daemon", "duel", "cross_review", "pipeline"] = "run"
     classification: Literal["healthy", "watch", "decision_required", "stopped"]
     score: int
     summary: str
     evidence: list[str] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
+    recommended_provider: AgentProvider | None = None
+    confidence: Literal["low", "medium", "high"] | None = None
+    primary_action: str = ""
+    secondary_actions: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
 
 
 class FailureFingerprint(BaseModel):

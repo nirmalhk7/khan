@@ -15,6 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_CONFIG = """global:
   codex_bin: codex
+  codex_model: gpt-5.4-mini
+  codex_reasoning_effort: high
   cursor_agent_bin: cursor-agent
   state_dir: __STATE_DIR__
   default_profile: default
@@ -23,6 +25,11 @@ notifications:
   input_needed: true
   say_bin: say
   phrase: Khan needs your input.
+adoption:
+  retention_days: 7
+daemon:
+  stale_heartbeat_seconds: 900
+  restart_on_crash: false
 profiles:
   default:
     max_iterations: 4
