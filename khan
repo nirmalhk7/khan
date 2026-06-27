@@ -12,4 +12,4 @@ while [ -L "$SOURCE" ]; do
 done
 
 ROOT=$(CDPATH= cd -P -- "$(dirname -- "$SOURCE")" && pwd)
-exec "$ROOT/.venv/bin/python" "$ROOT/scripts/khan_cli.py" "$@"
+exec "$ROOT/.venv/bin/python" "$ROOT/src/khan_cli.py" "$@"

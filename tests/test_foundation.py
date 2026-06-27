@@ -7,14 +7,15 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
 
 from typer.testing import CliRunner
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from khan_core.agent_adapters import AgentAdapterRegistry, AgentCommand, JsonlAgentAdapter
+from khan_core.agent_adapters import AgentAdapterRegistry, AgentCommand, CodexAgentAdapter, JsonlAgentAdapter
 from khan_core.agents import AgentSessionRunner
 from khan_core.adoption import AdoptionError, AdoptionManager
 from khan_core.attention import AttentionRouter

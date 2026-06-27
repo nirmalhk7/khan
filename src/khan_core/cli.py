@@ -813,4 +813,4 @@ def list_tasks() -> None:
 
 
 def main() -> None:
-    app()
+    app(prog_name="khan")
