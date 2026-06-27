@@ -1330,6 +1330,7 @@ projects: {{}}
         (repo / "base.txt").write_text("base\n")
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
 
         state = self.root / "state"
         config = self.root / "config.yaml"
