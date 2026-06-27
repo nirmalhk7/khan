@@ -1,0 +1,12 @@
+.git
+.github
+.khan
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.db
+*.log

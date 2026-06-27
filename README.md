@@ -70,6 +70,20 @@ Run tests:
 make test
 ```
 
+## Container Package
+
+Khan publishes semantic-versioned OCI images to GitHub Packages through GitHub
+Container Registry:
+
+```bash
+docker pull ghcr.io/nirmalhk7/khan:0.1.0
+docker run --rm ghcr.io/nirmalhk7/khan:0.1.0 --help
+```
+
+Release tags use semantic versioning with a leading `v`, for example
+`v0.1.0`. The package tags omit the leading `v` and also publish major/minor
+aliases such as `0.1`, `0`, and `latest`.
+
 ## Quick Start
 
 Initialize Khan and check the environment:
