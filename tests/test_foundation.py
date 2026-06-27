@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -32,6 +33,13 @@ from khan_core.loop_engine import LoopEngine
 from khan_core.models import AgentSessionEvent, ConfigFile, ProjectConfig, RunProcess, TaskCapsule
 from khan_core.queue_worker import QueueWorker, QueueWorkerError
 from khan_core.store import RunLockedError, Store
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    return ANSI_RE.sub("", text)
 
 
 FAKE_CODEX = r"""#!/usr/bin/env python3
@@ -151,26 +159,27 @@ class FoundationTests(unittest.TestCase):
     def test_root_help_uses_khan_program_name(self) -> None:
         result = CliRunner().invoke(app, ["--help"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Usage: khan", result.output)
-        self.assertIn("--install-completion", result.output)
-        self.assertIn("--show-completion", result.output)
-        self.assertIn("ask", result.output)
-        self.assertIn("inbox", result.output)
-        self.assertIn("show", result.output)
-        self.assertIn("get", result.output)
-        self.assertNotIn("describe", result.output)
-        self.assertNotIn("apply", result.output)
-        self.assertNotIn("delete", result.output)
+        output = plain(result.output)
+        self.assertIn("Usage: khan", output)
+        self.assertIn("install-completion", output)
+        self.assertIn("show-completion", output)
+        self.assertIn("ask", output)
+        self.assertIn("inbox", output)
+        self.assertIn("show", output)
+        self.assertIn("get", output)
+        self.assertNotIn("describe", output)
+        self.assertNotIn("apply", output)
+        self.assertNotIn("delete", output)
 
     def test_task_help_exposes_list_alias(self) -> None:
         result = CliRunner().invoke(app, ["task", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("│ list", result.output)
+        self.assertRegex(plain(result.output), r"\blist\b")
 
     def test_run_help_exposes_watch_alias(self) -> None:
         result = CliRunner().invoke(app, ["run", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("│ watch", result.output)
+        self.assertRegex(plain(result.output), r"\bwatch\b")
 
     def test_task_list_alias_lists_tasks(self) -> None:
         config = ConfigFile()
@@ -1045,6 +1054,7 @@ projects:
         run_result = CliRunner().invoke(
             app,
             ["ask", "p", "Prepare adoption preview.", "--mode", "single", "--config", str(config)],
+            catch_exceptions=False,
         )
         self.assertEqual(run_result.exit_code, 0, run_result.output)
         store = Store(state)
@@ -1100,7 +1110,11 @@ projects:
     env:
       FAKE_CHANGE: docs/retained.txt
 """)
-        result = CliRunner().invoke(app, ["ask", "p", "Create retained worktree.", "--mode", "single", "--config", str(config)])
+        result = CliRunner().invoke(
+            app,
+            ["ask", "p", "Create retained worktree.", "--mode", "single", "--config", str(config)],
+            catch_exceptions=False,
+        )
         self.assertEqual(result.exit_code, 0, result.output)
         store = Store(state)
         run = store.list_runs()[0]
@@ -1292,14 +1306,16 @@ projects: {{}}
             app,
             ["ask", str(repo), "Plan this with a pipeline.", "--config", str(config)],
             env={"FAKE_CHANGE": "docs/codex.txt", "FAKE_CURSOR_CHANGE": "docs/cursor.txt"},
+            catch_exceptions=False,
         )
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("pipeline", result.output.lower())
         self.assertIn("Evidence Ledger", result.output)
-        self.assertIn("decision-card.md", result.output)
         store = Store(state)
         self.assertEqual(len(store.list_tasks()), 1)
-        self.assertEqual(len(store.list_pipelines()), 1)
+        pipelines = store.list_pipelines()
+        self.assertEqual(len(pipelines), 1)
+        self.assertTrue(any(path.name == "decision-card.md" for path in store.list_artifacts(pipelines[0].id)))
         self.assertEqual(len(store.list_duels()), 1)
 
     def test_inspection_commands_render_last_summary_diff_and_explain(self) -> None:
@@ -1383,7 +1399,11 @@ projects:
     path: {repo}
     workspace_mode: in_place
 """)
-        relay = CliRunner().invoke(app, ["relay", str(repo), "Implement via relay.", "--preset", "codex-plan cursor-build", "--config", str(config)])
+        relay = CliRunner().invoke(
+            app,
+            ["relay", str(repo), "Implement via relay.", "--preset", "codex-plan cursor-build", "--config", str(config)],
+            catch_exceptions=False,
+        )
         self.assertEqual(relay.exit_code, 0, relay.output)
         self.assertIn("Relay finished", relay.output)
         store = Store(state)
