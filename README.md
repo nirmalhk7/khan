@@ -2,6 +2,9 @@
 
 Khan is a local multi-agent decision system for software engineering work.
 
+![Khan I Am Better GIF](https://media1.tenor.com/m/CDjVe93UNxcAAAAC/khan-i-am-better.gif)
+
+
 It turns a broad prompt into a tracked, inspectable pipeline: Codex writes an
 implementation brief, Codex and Cursor Agent build independently in isolated
 worktrees, completed candidates are cross-reviewed, and Khan produces a decision
